@@ -1,0 +1,4322 @@
+import collections
+import datetime
+import json
+import math
+import os
+import queue
+import random
+import re
+import threading
+import time
+import traceback
+import urllib.parse
+import urllib.request
+from typing import Any, Dict, List, Optional, Tuple
+
+from android.content import ClipData, ClipboardManager, ComponentName, Context, DialogInterface, Intent
+from android.graphics import Bitmap, Canvas, Paint
+from android.graphics.drawable import GradientDrawable
+from android.hardware import Sensor, SensorEventListener, SensorManager
+from android.media import AudioManager
+from android.os import BatteryManager, Environment, Handler, Looper, PowerManager, SystemClock
+from android.provider import Settings
+from android.util import TypedValue
+from android.view import Gravity, KeyEvent, MotionEvent, Surface, SurfaceView, TextureView, View, ViewGroup
+from android.view.animation import AccelerateInterpolator, DecelerateInterpolator, OvershootInterpolator
+from android.widget import EditText, FrameLayout, ImageView, LinearLayout, ScrollView, TextView
+from androidx.recyclerview.widget import RecyclerView
+from java import dynamic_proxy, jarray, jbyte, jclass, jint
+from org.telegram.messenger import AndroidUtilities, MediaController, MessagesController, NotificationCenter, UserConfig, UserObject
+from org.telegram.ui import ChatActivity, LaunchActivity
+from org.telegram.ui.ActionBar import AlertDialog, Theme
+
+from android_utils import R, log, run_on_ui_thread
+from base_plugin import AppEvent, BasePlugin, HookResult, MenuItemData, MenuItemType
+from client_utils import get_last_fragment
+from ui.settings import Divider, Header, Selector, Switch, Text
+
+try:
+    from org.telegram.ui.Cells import ChatMessageCell
+except Exception:
+    ChatMessageCell = None
+
+WeakReference = jclass("java.lang.ref.WeakReference")
+
+__id__ = "clawd_pet"
+__name__ = "Clawd"
+__description__ = (
+    "Ультимативный интерактивный питомец для Telegram v3.4.\n\n"
+    "• Синхронное караоке (LRCLIB + NetEase) и SoundCloud oEmbed.\n"
+    "• Бесшовная интеграция с Clawd Bridge и Tap-to-Sync [📋].\n"
+    "• Режим «Абсолютный Обжора» 2.0: безопасное поедание любого View с WeakReference.\n"
+    "• Глубокая логика Telegram: разделяет свои заметки и входящие сообщения.\n"
+    "• Лазерная указка двумя пальцами, гравитация на всех экранах и 11 шапок."
+)
+__author__ = "@tsobbb"
+__version__ = "3.4"
+__icon__ = "clawd_poop_5050_1783593604/0"
+
+GRID_W = 18
+GRID_H = 13
+SIZE_ITEMS = ["Маленький", "Средний", "Большой"]
+SIZE_DP = [3.0, 4.0, 5.0]
+
+PALETTES = [
+    ("Claude (Оригинал)", 0xFFD97757, 0xFF1A1A1A),
+    ("Claude Dark", 0xFF383838, 0xFFF5F5F5),
+    ("Anthropic Spark", 0xFFE06C38, 0xFF1A1A1A),
+    ("Мятный", 0xFF4FBF98, 0xFF12241D),
+    ("Лавандовый", 0xFF9B8AEE, 0xFF1B1631),
+    ("Небесный", 0xFF4FA8E8, 0xFF0E1C29),
+    ("Сакура", 0xFFEE85AE, 0xFF2A1220),
+    ("Киберпанк Неон", 0xFF00E5FF, 0xFF0A0A14),
+    ("Золотой Слиток", 0xFFFFD700, 0xFF3E2723),
+    ("Радужный RGB", 0xFF000000, 0xFFFFFFFF),
+    ("Хамелеон (Тема)", 0x00000000, 0xFFFFFFFF),
+]
+
+HATS = [
+    "Без шапки",
+    "Наушники DJ",
+    "Корона 👑",
+    "Шерлок 🔍",
+    "Ночной колпак",
+    "Кошачьи ушки 🐱",
+    "Цилиндр и Монокль 🎩",
+    "Каска Сапёра ⛑",
+    "Очки Thug Life 😎",
+    "Шляпа Мага 🧙‍♂️",
+    "Кепка назад",
+]
+
+SLEEP_ITEMS = ["Через 1 минуту", "Через 3 минуты", "Через 10 минут", "Никогда"]
+SLEEP_SECONDS = [60, 180, 600, 0]
+
+AUTO_RETURN_ITEMS = ["Через 30 секунд", "Через 2 минуты", "Через 10 минут"]
+AUTO_RETURN_SECONDS = [30.0, 120.0, 600.0]
+
+LOG_LEVELS = ["DEBUG", "INFO", "WARN", "ERROR"]
+LEVEL_VALUES = {"DEBUG": 10, "INFO": 20, "WARN": 30, "ERROR": 40}
+
+HEART_COLOR = 0xFFFF5C7A
+ZZZ_COLOR = 0xFF8FA3BF
+SPARK_COLOR = 0xFFFFC94D
+NOTE_COLOR = 0xFF6FB8FF
+POOP_COLORS = {"X": 0xFF8A5A33, "o": 0xFFB27D4E, "w": 0xFFFFFFFF, "k": 0xFF1A1A1A}
+GOLD_POOP_COLORS = {"X": 0xFFD4AF37, "o": 0xFFFFDF73, "w": 0xFFFFFFFF, "k": 0xFF5A4500}
+
+MAX_LOG_FILE_SIZE = 512 * 1024  # строго 512 КБ
+MAX_LYRICS_FILES = 200
+
+PATTERNS = {
+    "heart": (
+        ".XX.XX.",
+        "XXXXXXX",
+        "XXXXXXX",
+        ".XXXXX.",
+        "..XXX..",
+        "...X...",
+    ),
+    "zzz": (
+        "XXXXX",
+        "...X.",
+        "..X..",
+        ".X...",
+        "XXXXX",
+    ),
+    "spark": (
+        "..X..",
+        "..X..",
+        "XX.XX",
+        "..X..",
+        "..X..",
+    ),
+    "note": (
+        "..XXXXX",
+        "..X...X",
+        "..X...X",
+        "..X...X",
+        "XXX.XXX",
+        "XXX.XXX",
+    ),
+    "poop": (
+        "....X....",
+        "...XXo...",
+        "..XXXXX..",
+        ".XXXXXXo.",
+        ".XwkXwkX.",
+        "XXXXXXXXo",
+        "XXXXXXXXX",
+    ),
+}
+
+KEYWORDS = (
+    ("love", re.compile(r"❤|♥|💕|💖|😘|😍|🥰|\bлюблю\b|\bобнима\w*|\bцелую\b|\blove\b|\bмилаш\w*|\bкохаю\b")),
+    ("laugh", re.compile(r"(?:ха){2,}|(?:хе){2,}|\bлол\b|\blol\b|\bржу\w*|😂|🤣|😆|\bору\b|\bрофл\w*")),
+    ("hi", re.compile(r"\b(?:привет\w*|здравствуй\w*|хай|салют|hello|hi|hey|доброе утро|добрый день|привіт|вітаю)\b")),
+    ("bye", re.compile(r"\b(?:пока|споки|спокойной ночи|до завтра|бб|доброй ночи|сладких снов|бай|бувай|до побачення)\b")),
+    ("thanks", re.compile(r"\b(?:спасибо|благодарю|thanks|thx|thank you|дякую|спасибі)\b")),
+    ("money", re.compile(r"\b(?:деньги|бабки|бабло|кэш|usdt|крипт\w*|карт\w*|перевод|скинь|оплат\w*|зарплат\w*|\$|€|₽|гроші|кошти)\b")),
+    ("food", re.compile(r"\b(?:пицц\w*|бургер\w*|шаурм\w*|шав\w*|кушать|жрать|покушал\w*|суши|кофе|чай|чипсы|вкусн\w*|їсти|смачно)\b")),
+    ("sad", re.compile(r"\b(?:грустн\w*|плач\w*|печал\w*|слез\w*|депресс\w*|тоск\w*|одинок\w*|хнык|😭|😢|😿|💔|сумно)\b")),
+    ("angry", re.compile(r"\b(?:бесит|злюсь|сука|блять|нах\w*|заеб\w*|отвали|заткнись|гори|убью|ненавижу|черт|ярость)\b")),
+    ("work", re.compile(r"\b(?:дедлайн|диплом|сесси\w*|экзамен\w*|работ\w*|начальник|отчет|проект|код\w*|баг\w*|робота)\b")),
+    ("compliment", re.compile(r"\b(?:клавд|клод|clawd|красавчик|умница|лучший|топчик|красота|милота|гарний)\b")),
+    ("question", re.compile(r"\b(?:почему|зачем|когда|куда|откуда|правда ли|чому|навіщо|коли)\b|\?\?\?+")),
+    ("gaming", re.compile(r"\b(?:игра\w*|катка|дот\w*|кс|cs|steam|вин\w*|луз\w*|гейм\w*|бравл|майн\w*|грати)\b")),
+    ("memes", re.compile(r"\b(?:мем\w*|кринж\w*|база|сигма|скуф\w*|чилл\w*|форс\w*)\b")),
+    ("music", re.compile(r"\b(?:музык\w*|песн\w*|трек\w*|альбом\w*|бит|мелоди\w*|плейлист\w*|спой|пісня|музика)\b")),
+    ("secret", re.compile(r"\b(?:секрет\w*|тайн\w*|никому не говори|между нами|инсайд\w*|таємниця)\b")),
+)
+
+PHRASES = {
+    "hello": ["Привет!", "Я Clawd v3.4!", "О, это ты!", "Готов тусить!", "Чем займёмся?"],
+    "idle": [
+        "Чем помочь?", "Хм…", "Думаю…", "Можно я тут посижу?",
+        "Ты молодец!", "Не забудь попить воды", "Пип-пип!",
+        "Мне нравится этот чат", "*оглядывается*", "Пишу код… шучу",
+        "Скучновато… скинь мем!", "Сейчас {time}, продуктивно!",
+    ],
+    "tap": ["Ой!", "Эй!", "Чего?", "Я тут!", "Хи!", "Не щекочи!"],
+    "annoyed": ["Хватит тыкать!", "Щекотно же!", "Ну всё, обиделся", "Эй, полегче!", "Я тебе не кнопка!"],
+    "pet": ["Мрр…", "Ещё!", "Приятно ♥", "Хи-хи", "Лучший день!", "♥♥♥", "Мур-мур-мур"],
+    "drag": ["Ааа!", "Куда мы?", "Поставь меня!", "Головокружение!", "Лечу-у-у!"],
+    "throw": ["Уиии!", "Я лечу!", "Ваааа!", "Посадка не гарантирована!"],
+    "dizzy": ["Голова кружится…", "@_@", "Где я?", "Земля ушла из-под лап…"],
+    "wake": ["А? Что?", "Я не спал!", "*зевает*", "Уже утро?"],
+    "jump": ["Хоп!", "Йе!", "Ура!", "Выше крыши!"],
+    "laser_chase": ["ТОЧКА!", "ПОЙМАЮ!", "ОНА ТУТ!", "СТОЯТЬ!", "ААА, ЛАЗЕР!"],
+    "eat": [
+        "Ням!", "Хрум-хрум", "Вкусный кусок UI", "*жуёт*", "Ммм, свежие пиксели!",
+        "Хрустящая кнопка!", "Пиксели тают во рту!", "Интерфейс сегодня особенно аппетитный ✨",
+        "Закусил элементом экрана", "Сытный пиксельный перекус!", "Мням, интерфейс стал чище!",
+    ],
+    "eat_edittext": [
+        "Съел поле ввода, теперь молчи 🤫",
+        "Клавиатура временно заблокирована моим желудком!",
+        "Больше никаких сообщений 🤐",
+        "Ввод проглочен! Тишина в эфире",
+        "Меньше слов — больше дела, поле ввода у меня внутри!",
+    ],
+    "eat_message": [
+        "Перевариваю чужие сплетни 💌",
+        "Вкусное сообщение!",
+        "Слишком много текста было… пришлось съесть!",
+        "Слопал важное сообщение, ой!",
+        "Питательный чат! Текст оказался сытным",
+    ],
+    "eat_header": [
+        "Откусил кусок шапки!",
+        "Тулбар был аппетитным 🎩",
+        "Где теперь название чата? В животе!",
+        "Шапка съедена, гуляем без неё!",
+        "Верхняя панель оказалась на удивление хрустящей!",
+    ],
+    "eat_avatar": [
+        "Съел твою аватарку! 👤",
+        "Кругляш на десерт!",
+        "Красивая фотка была… ням!",
+        "Аватарка отправилась в желудок!",
+        "Портрет переварен с удовольствием!",
+    ],
+    "eat_chubby": ["Хрум! Вкусновато, но щёчки растут…", "Ммм, ещё кусочек интерфейса!"],
+    "eat_fat": ["Ох… кажется, я тяжелею…", "Штаны лопнут!", "Многовато кнопок съел…"],
+    "eat_balloon": ["Я ШАР! Я КОЛОБОК!", "Всё, перекат вместо шага… *ик*", "Не могу больше двигаться…"],
+    "spit": ["Ладно, отдаю!", "Тьфу!", "Ой, простите", "Забирай…", "Я на диете!"],
+    "mail": ["Тебе пишут!", "Сообщение от {name}!", "Входящее!", "Динь-динь!"],
+    "sent": ["Отправлено!", "Улетело!", "Хорошо сказано!", "Пиу!"],
+    "sent_self": ["Записал в заметки!", "Сохранено в Избранное!", "Надёжно спрятано ♥", "В копилку мыслей!"],
+    "thanks": [
+        "Всегда пожалуйста! ♥", "Обращайся!", "Рад помочь!", "Ты супер!",
+        "Мурр, на здоровье!", "Не за что!", "Для тебя — всё что угодно!",
+        "Пип-пип, обращайся!", "Всегда к твоим услугам!", "Приятно слышать ♥",
+    ],
+    "essay": ["Ого, целое эссе", "Это роман?", "Много букв!", "Лев Толстой в чате"],
+    "love": ["Ааа, мило ♥", "♥♥♥", "Как трогательно!", "Любовь в воздухе~"],
+    "laugh": ["Ахаха!", "Хи-хи-хи", "Смешно!", "Ору чайкой!"],
+    "hi": ["Привет-привет!", "И тебе привет!", "Здрасьте!", "*машет*"],
+    "bye": ["До завтра!", "Сладких снов!", "Споки-ноки!", "Увидимся!"],
+    "money": ["О, запахло деньгами!", "Мне на корм скиньте!", "Инвестирую в пиксели!"],
+    "food": ["А мне кусочек?", "Я тоже голоден!", "Звучит вкусно ♥", "Ммм, еда!"],
+    "sad": ["Я с тобой", "Не грусти, человек!", "Обнимаю пикселями ♥", "Всё наладится!"],
+    "angry": ["Ой-ой, полегче!", "Не ругайтесь…", "Кажется, назревает буря ⚡"],
+    "work": ["Опять дедлайны…", "Иди попей кофе!", "Код сам себя не напишет!"],
+    "compliment": ["Это я! ♥", "Засмущал…", "Спасибо, ты тоже лучший!", "Приятно слышать!"],
+    "question": ["Хороший вопрос…", "Гугл в помощь!", "Хм, дай подумать…"],
+    "gaming": ["Го в катку!", "Тащи раунд!", "Не сливай!", "GG WP!"],
+    "memes": ["Ахаха, вот это база!", "Чистый кринж… но смешно", "Одобряю этот мем!"],
+    "music": ["О, музыка!", "Танцуем!", "Это мой трек!", "♪♪♪", "Качает!"],
+    "listen": ["Слушаю…", "Кто это говорит?", "*внимательно слушает*"],
+    "secret": ["Никому не скажу! 🤫", "Мой рот на замке!", "Тайна сохранена!"],
+    "music_end": ["Эх, закончилось", "Ещё!", "Хороший трек был"],
+    "no_lyrics": ["Слов не нашёл :(", "Пою без слов: Ла-ла-ла ♪", "Слов нет, но бит качает!"],
+    "sync_unavailable": ["Синхронизация недоступна", "Таймлайн не найден, но бит качает! 🎵"],
+    "chat_again": ["О, опять этот чат", "Снова сюда?", "Опять {name}?"],
+    "chat_new": ["О, {name}!", "Это же {name}!", "Привет, {name}!"],
+    "chat_self": ["Твои заметки!", "Избранное, уютно", "Что сохраним?"],
+    "shake": ["Аааа!", "Землетрясение!", "Хватит трясти!"],
+    "slide": ["Скользко!", "Уиии~", "Меня несёт!"],
+    "hang": ["Держусь!", "Помогите!", "Высоковато…"],
+    "hang_fall": ["Ой-ой-ой!", "Не удержался!", "Падаю!"],
+    "peek": ["Ку-ку!", "Я тебя вижу", "*подглядывает*"],
+    "found": ["Нашёл меня!", "Эх, раскусил!"],
+    "poop": ["Упс…", "Это не я!", "Ой…", "*краснеет*"],
+    "poop_gold": ["ОГО! Золотая кучка!", "Я богат!", "Смотри, как блестит!"],
+    "clean": ["Спасибо!", "Прости…", "Ты лучший дворник ♥"],
+    "read": ["Прочитано! ✔✔", "Ура, не игнорит!", "Увидел!"],
+    "typing": ["{name} что-то пишет… 👀", "Тс-с, нам отвечают!", "Печатает…"],
+    "deleted": ["Я видел! Тут что-то удалили!", "Улика уничтожена…", "Что там было?!"],
+    "battery_low": ["Батарейка {battery}%…", "Найди розетку… умираю…", "Мало энергии…"],
+    "charging": ["Подзарядка пошла! ⚡", "100 гигаватт!", "Полон сил!"],
+    "clean_cache": [
+        "Мусор убран! Telegram стал шустрее 🧹",
+        "Вымел лишний кэш, дышать стало легче!",
+        "Подмёл байты, протёр пиксели ✨",
+        "Минус 100 мегабайт пыли из памяти!",
+        "Чистота — залог быстрого чата!",
+        "Работаю дворником за пиксели и лайки ♥",
+        "Все углы выметены, хозяин!",
+    ],
+}
+
+FORTUNES = [
+    "Определенно да!",
+    "Даже не думай.",
+    "Звёзды говорят: отправь стикер.",
+    "Шансы 50 на 50.",
+    "Спроси в другом чате.",
+    "Лучше промолчи.",
+    "100% успех!",
+    "Будет весело!",
+    "Ответ спрятан в голосовом.",
+]
+
+MAX_KEYWORD_TEXT = 400
+MAX_SCAN_MESSAGES = 10
+MAX_CHAT_VISITS = 200
+MAX_PARTICLES = 16
+MAX_FRAME_CACHE = 64
+MAX_EATEN = 12
+MAX_POOPS = 3
+POOP_EVERY = (3, 6)
+EARTH_G = 9.81
+SHAKE_JERK = 13.0
+SHAKE_HITS = 3
+SHAKE_WINDOW = 0.8
+TILT_DEAD = 0.18
+PEEK_AFTER = 45.0
+PEEK_HIDDEN_UNITS = 3
+PEEK_OUT_UNITS = 7
+
+
+def as_java_color(color: int) -> int:
+    value = int(color) & 0xFFFFFFFF
+    return value - 0x100000000 if value >= 0x80000000 else value
+
+
+def mix_color(a: int, b: int, t: float) -> int:
+    out = 0xFF000000
+    for shift in (16, 8, 0):
+        ca = (a >> shift) & 0xFF
+        cb = (b >> shift) & 0xFF
+        out |= int(ca + (cb - ca) * t) << shift
+    return out
+
+
+def clamp(value, lo, hi):
+    if hi < lo:
+        return lo
+    return lo if value < lo else hi if value > hi else value
+
+
+class ClaudeLogger:
+    """Асинхронное структурированное логирование с ротацией 512 КБ и кольцевым буфером на 500 записей."""
+
+    def __init__(self):
+        self.base_dir = None
+        self.logs_dir = None
+        self.errors_dir = None
+        self.lyrics_dir = None
+        self.ring_buffer = collections.deque(maxlen=500)
+        self.min_level_str = "INFO"
+        self._write_queue = queue.Queue()
+        self._stop_event = threading.Event()
+        self._writer_thread = None
+        self._last_rate_limited = {}
+        self._init_dirs()
+        self._start_writer()
+
+    def _init_dirs(self):
+        try:
+            download_dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS).getAbsolutePath()
+            self.base_dir = os.path.join(download_dir, "ClaudePet")
+            self.logs_dir = os.path.join(self.base_dir, "Logs")
+            self.errors_dir = os.path.join(self.base_dir, "Errors")
+            self.lyrics_dir = os.path.join(self.base_dir, "Lyrics")
+
+            for d in (self.logs_dir, self.errors_dir, self.lyrics_dir):
+                os.makedirs(d, exist_ok=True)
+        except Exception as e:
+            log(f"[{__id__}] logger init error: {e}")
+
+    def _start_writer(self):
+        self._writer_thread = threading.Thread(target=self._writer_worker, daemon=True, name="claude_log_writer")
+        self._writer_thread.start()
+
+    def _writer_worker(self):
+        batch = []
+        last_flush = time.monotonic()
+        while not self._stop_event.is_set():
+            try:
+                item = self._write_queue.get(timeout=0.4)
+                if item is None:
+                    break
+                batch.append(item)
+                # Если накопилось 10 записей или есть ERROR — сбрасываем немедленно
+                is_urgent = item[0] == "ERROR" or len(batch) >= 10 or (time.monotonic() - last_flush > 2.0)
+                if is_urgent:
+                    self._flush_batch(batch)
+                    batch = []
+                    last_flush = time.monotonic()
+            except queue.Empty:
+                if batch:
+                    self._flush_batch(batch)
+                    batch = []
+                    last_flush = time.monotonic()
+            except Exception:
+                pass
+        if batch:
+            self._flush_batch(batch)
+
+    def _flush_batch(self, batch: List[Tuple[str, str, str]]):
+        if not self.logs_dir:
+            return
+        runtime_fp = os.path.join(self.logs_dir, "ClaudePet_Runtime.txt")
+        errors_fp = os.path.join(self.errors_dir, "ClaudePet_Errors.txt")
+
+        try:
+            runtime_lines = []
+            error_lines = []
+            for level, tag, line in batch:
+                runtime_lines.append(line + "\n")
+                if level == "ERROR":
+                    error_lines.append(line + "\n")
+
+            if runtime_lines:
+                self._rotate_if_needed(runtime_fp, is_runtime=True)
+                with open(runtime_fp, "a", encoding="utf-8") as f:
+                    f.writelines(runtime_lines)
+
+            if error_lines:
+                self._rotate_if_needed(errors_fp, is_runtime=False)
+                with open(errors_fp, "a", encoding="utf-8") as f:
+                    f.writelines(error_lines)
+        except Exception:
+            pass
+
+    def _rotate_if_needed(self, fp: str, is_runtime: bool):
+        try:
+            if not os.path.exists(fp):
+                return
+            size = os.path.getsize(fp)
+            if size < MAX_LOG_FILE_SIZE:
+                return
+            if is_runtime:
+                rot_fp = os.path.join(self.logs_dir, "ClaudePet_Runtime.1.txt")
+                if os.path.exists(rot_fp):
+                    try:
+                        os.remove(rot_fp)
+                    except Exception:
+                        pass
+                os.rename(fp, rot_fp)
+            else:
+                # ClaudePet_Errors.txt: усекается с сохранением последних 200 строк
+                with open(fp, "r", encoding="utf-8") as f:
+                    lines = f.readlines()
+                kept = lines[-200:]
+                with open(fp, "w", encoding="utf-8") as f:
+                    f.writelines(kept)
+        except Exception:
+            pass
+
+    def flush_and_stop(self):
+        self._stop_event.set()
+        try:
+            self._write_queue.put_nowait(None)
+        except Exception:
+            pass
+        if self._writer_thread and self._writer_thread.is_alive():
+            self._writer_thread.join(timeout=1.0)
+
+    def log(self, level: str, tag: str, message: str, key_values: Optional[Dict[str, Any]] = None):
+        lvl_val = LEVEL_VALUES.get(level, 20)
+        min_val = LEVEL_VALUES.get(self.min_level_str, 20)
+
+        # Формат: ГГГГ-ММ-ДД ЧЧ:ММ:СС.mmm | LEVEL | TAG | сообщение | key=value
+        ts_now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        kv_str = ""
+        if key_values:
+            kv_str = " | " + " ".join(f"{k}={v}" for k, v in key_values.items())
+        line = f"{ts_now} | {level:<5} | {tag} | {message}{kv_str}"
+
+        # Добавляем в кольцевой буфер всегда
+        self.ring_buffer.append(line)
+        log(f"[{tag}] {message}")
+
+        if lvl_val >= min_val:
+            try:
+                self._write_queue.put_nowait((level, tag, line))
+            except Exception:
+                pass
+
+    def log_debug(self, tag: str, message: str, **kwargs):
+        self.log("DEBUG", tag, message, kwargs if kwargs else None)
+
+    def log_info(self, tag: str, message: str, **kwargs):
+        self.log("INFO", tag, message, kwargs if kwargs else None)
+
+    def log_warn(self, tag: str, message: str, **kwargs):
+        self.log("WARN", tag, message, kwargs if kwargs else None)
+
+    def log_error(self, tag: str, message: str, exc: Optional[Exception] = None, rate_limit_key: Optional[str] = None, **kwargs):
+        now = time.monotonic()
+        if rate_limit_key:
+            last = self._last_rate_limited.get(rate_limit_key, 0.0)
+            if now - last < 5.0:
+                return
+            self._last_rate_limited[rate_limit_key] = now
+
+        msg = message
+        if exc:
+            msg += f" (exc: {exc})"
+        self.log("ERROR", tag, msg, kwargs if kwargs else None)
+
+    def check_lyrics_archive(self, artist: str, title: str) -> Optional[str]:
+        if not self.lyrics_dir:
+            return None
+        safe = re.sub(r'[\\/*?:"<>|]', "", f"{artist} - {title}").strip()[:60]
+        for ext in (".txt", ".lrc"):
+            fp = os.path.join(self.lyrics_dir, f"{safe}{ext}")
+            if os.path.exists(fp):
+                try:
+                    with open(fp, "r", encoding="utf-8") as f:
+                        text = f.read().strip()
+                        if text:
+                            self.log_info("LYRICS", f"Текст мгновенно загружен из архива: {safe}{ext}")
+                            return text
+                except Exception:
+                    pass
+        return None
+
+    def save_lyrics_archive(self, artist: str, title: str, text: str):
+        if not self.lyrics_dir or not text:
+            return
+        try:
+            files = []
+            for fn in os.listdir(self.lyrics_dir):
+                if fn.endswith((".txt", ".lrc")):
+                    p = os.path.join(self.lyrics_dir, fn)
+                    try:
+                        files.append((p, os.path.getmtime(p)))
+                    except Exception:
+                        pass
+
+            # Лимит 200 файлов: удаляем старейший
+            if len(files) >= MAX_LYRICS_FILES:
+                files.sort(key=lambda x: x[1])
+                oldest_fp = files[0][0]
+                try:
+                    os.remove(oldest_fp)
+                    self.log_info("LYRICS", f"Ротация кэша слов: удален старый файл {os.path.basename(oldest_fp)}")
+                except Exception:
+                    pass
+
+            safe = re.sub(r'[\\/*?:"<>|]', "", f"{artist} - {title}").strip()[:60]
+            fp = os.path.join(self.lyrics_dir, f"{safe}.txt")
+            with open(fp, "w", encoding="utf-8") as f:
+                f.write(text)
+            self.log_info("LYRICS", f"Текст сохранен в архив: {safe}.txt")
+        except Exception as e:
+            self.log_error("LYRICS", f"Ошибка архивации текста: {e}")
+
+
+CLOG = ClaudeLogger()
+
+
+# Безопасный Telegram OnButtonClickListener
+try:
+    TGOnButtonClickListener = AlertDialog.OnButtonClickListener
+except Exception:
+    TGOnButtonClickListener = None
+
+if TGOnButtonClickListener is not None:
+    class TGDialogClickListener(dynamic_proxy(TGOnButtonClickListener)):
+        def __init__(self, callback):
+            super().__init__()
+            self.callback = callback
+
+        def onClick(self, dialog, which):
+            try:
+                if self.callback:
+                    self.callback(dialog, which)
+            except Exception as e:
+                CLOG.log_error("TG_DIALOG", "Click error", e)
+else:
+    class TGDialogClickListener(dynamic_proxy(DialogInterface.OnClickListener)):
+        def __init__(self, callback):
+            super().__init__()
+            self.callback = callback
+
+        def onClick(self, dialog, which):
+            try:
+                if self.callback:
+                    self.callback(dialog, which)
+            except Exception as e:
+                CLOG.log_error("DIALOG", "Click error", e)
+
+
+class DialogClickListener(dynamic_proxy(DialogInterface.OnClickListener)):
+    def __init__(self, callback):
+        super().__init__()
+        self.callback = callback
+
+    def onClick(self, dialog, which):
+        try:
+            if self.callback:
+                self.callback(dialog, which)
+        except Exception as e:
+            CLOG.log_error("DIALOG", "Click error", e)
+
+
+class ViewClickListener(dynamic_proxy(View.OnClickListener)):
+    def __init__(self, callback):
+        super().__init__()
+        self.callback = callback
+
+    def onClick(self, view):
+        try:
+            if self.callback:
+                self.callback(view)
+        except Exception as e:
+            CLOG.log_error("VIEW", "Click error", e)
+
+
+class RecyclerAttachStateListener(dynamic_proxy(RecyclerView.OnChildAttachStateChangeListener)):
+    """Безопасный listener переиспользования и скролла ячеек RecyclerView."""
+
+    def __init__(self, plugin, target_view, original_alpha: float):
+        super().__init__()
+        self.plugin = plugin
+        self.target_ref = WeakReference(target_view)
+        self.original_alpha = original_alpha
+
+    def onChildViewAttachedToWindow(self, view):
+        pass
+
+    def onChildViewDetachedFromWindow(self, view):
+        try:
+            target = self.target_ref.get() if self.target_ref else None
+            if target is not None and (view.equals(target) or view is target):
+                # Мгновенно восстанавливаем alpha при откреплении (скролле) или переиспользовании адаптером!
+                target.setAlpha(float(self.original_alpha))
+                if self.plugin:
+                    self.plugin._on_recycler_cell_detached(target)
+        except Exception as e:
+            CLOG.log_error("RECYCLER", "Attach listener error", e)
+
+
+class LyricsHelper:
+    """Караоке, SoundCloud oEmbed и локальный архив LRCLIB / NetEase."""
+
+    def __init__(self, logger_cb=None):
+        self.cache: Dict[Tuple[str, str], List[Tuple[float, str]]] = {}
+        self.lock = threading.Lock()
+        self.loading = set()
+        self.logger_cb = logger_cb
+
+    def _log(self, text: str):
+        if self.logger_cb:
+            self.logger_cb(text)
+        CLOG.log_info("LYRICS", text)
+
+    @staticmethod
+    def clean_metadata(artist: str, title: str) -> Tuple[str, str]:
+        a = (artist or "").strip()
+        t = (title or "").strip()
+
+        if "soundcloud.com/" in t:
+            m = re.search(r"soundcloud\.com/([^/]+)/([^/?#]+)", t)
+            if m:
+                a, t = m.group(1).replace("-", " "), m.group(2).replace("-", " ")
+
+        t = re.sub(r"\.(mp3|m4a|flac|ogg|wav|opus)$", "", t, flags=re.I).strip()
+        t = re.sub(r"\|.*", "", t)
+        t = re.sub(r"\/\/.*", "", t)
+        t = re.sub(r"@\w+", "", t)
+        t = re.sub(r"https?://\S+", "", t)
+        t = re.sub(r"^(?:stream|listen to)\s+", "", t, flags=re.I)
+
+        if " - " in t:
+            parts = t.split(" - ", 1)
+            left, right = parts[0].strip(), parts[1].strip()
+            if not a:
+                a, t = left, right
+            elif a.lower() in left.lower():
+                t = right
+            elif left.lower() not in a.lower():
+                a, t = left, right
+
+        t = re.sub(r"^\d{1,3}[\.\-\s]+", "", t)
+        t = re.sub(r"\[.*?\]", "", t)
+        t = re.sub(
+            r"\((?:official|music\s*video|lyric\s*video|audio|hd|remaster\w*|live|mv|clip|exclusive).*?\)",
+            "", t, flags=re.I,
+        )
+        t = re.sub(r"\(?(?:feat\.|ft\.|prod\.)\s+[^)]*\)?", "", t, flags=re.I)
+        a = re.sub(r"\(?(?:feat\.|ft\.|prod\.)\s+[^)]*\)?", "", a, flags=re.I)
+        return a.strip(" -_()[]{}'\""), t.strip(" -_()[]{}'\"")
+
+    @staticmethod
+    def parse_lrc(lrc_text: str) -> List[Tuple[float, str]]:
+        if not lrc_text:
+            return []
+        timeline = []
+        offset_sec = 0.0
+
+        offset_match = re.search(r"\[offset:\s*([+-]?\d+)\]", lrc_text, re.I)
+        if offset_match:
+            try:
+                offset_sec = float(offset_match.group(1)) / 1000.0
+            except Exception:
+                offset_sec = 0.0
+
+        time_tag_regex = re.compile(r"\[(\d{1,2}):(\d{2})(?:[.:](\d{1,3}))?\]")
+        for raw_line in lrc_text.splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith(("[ti:", "[ar:", "[al:", "[by:", "[re:", "[ve:")):
+                continue
+            matches = list(time_tag_regex.finditer(line))
+            if not matches:
+                continue
+            text = time_tag_regex.sub("", line).strip()
+            if not text:
+                continue
+            for m in matches:
+                mm, ss = int(m.group(1)), int(m.group(2))
+                ms_str = m.group(3)
+                frac = float(f"0.{ms_str}") if ms_str else 0.0
+                t_sec = max(0.0, mm * 60.0 + ss + frac + offset_sec)
+                timeline.append((t_sec, text))
+
+        timeline.sort(key=lambda x: x[0])
+        return timeline
+
+    def _req(self, url: str) -> Optional[dict]:
+        try:
+            req = urllib.request.Request(
+                url, headers={"User-Agent": "Mozilla/5.0 (Android; ClawdKaraoke/3.4)"}
+            )
+            with urllib.request.urlopen(req, timeout=3.5) as resp:
+                if resp.status == 200:
+                    return json.loads(resp.read().decode("utf-8"))
+        except Exception:
+            pass
+        return None
+
+    def resolve_soundcloud_url(self, sc_url: str) -> Optional[Tuple[str, str]]:
+        try:
+            q = urllib.parse.quote(sc_url.strip())
+            data = self._req(f"https://soundcloud.com/oembed?url={q}&format=json")
+            if data and data.get("title"):
+                return self.clean_metadata(data.get("author_name", ""), data.get("title", ""))
+        except Exception:
+            pass
+        return None
+
+    def fetch_lrclib(self, artist: str, title: str) -> Optional[str]:
+        if artist:
+            qa, qt = urllib.parse.quote(artist), urllib.parse.quote(title)
+            data = self._req(f"https://lrclib.net/api/get?artist_name={qa}&track_name={qt}")
+            if data and data.get("syncedLyrics"):
+                return data.get("syncedLyrics")
+
+        query = urllib.parse.quote(f"{artist} {title}".strip())
+        results = self._req(f"https://lrclib.net/api/search?q={query}")
+        if isinstance(results, list):
+            for item in results:
+                if item.get("syncedLyrics"):
+                    return item.get("syncedLyrics")
+        return None
+
+    def fetch_netease(self, artist: str, title: str) -> Optional[str]:
+        for q_str in (f"{artist} {title}".strip(), title.strip()):
+            if not q_str:
+                continue
+            query = urllib.parse.quote(q_str)
+            data = self._req(f"https://music.163.com/api/search/get?s={query}&type=1&limit=3")
+            if not data:
+                continue
+            songs = data.get("result", {}).get("songs", [])
+            for song in songs:
+                song_id = song.get("id")
+                if not song_id:
+                    continue
+                ldata = self._req(f"https://music.163.com/api/song/lyric?id={song_id}&lv=1&kv=1&tv=-1")
+                if ldata:
+                    lrc = ldata.get("lrc", {}).get("lyric")
+                    if lrc and "[" in lrc:
+                        return lrc
+        return None
+
+    def get_lyrics_async(self, artist: str, title: str, callback):
+        clean_a, clean_t = self.clean_metadata(artist, title)
+        if not clean_t:
+            callback([])
+            return
+
+        key = (clean_a.lower(), clean_t.lower())
+        with self.lock:
+            if key in self.cache:
+                callback(self.cache[key])
+                return
+            if key in self.loading:
+                return
+            self.loading.add(key)
+
+        def _worker():
+            # 1. Проверяем локальный архив на диске
+            cached_text = CLOG.check_lyrics_archive(clean_a, clean_t)
+            source_tag = "ARCHIVE"
+            lrc = cached_text
+
+            if not lrc:
+                self._log(f"Поиск слов в сети: '{clean_a}' — '{clean_t}'")
+                lrc = self.fetch_lrclib(clean_a, clean_t)
+                source_tag = "LRCLIB"
+                if not lrc:
+                    lrc = self.fetch_netease(clean_a, clean_t)
+                    source_tag = "NETEASE"
+                if lrc:
+                    CLOG.save_lyrics_archive(clean_a, clean_t, lrc)
+
+            timeline = self.parse_lrc(lrc) if lrc else []
+            with self.lock:
+                self.cache[key] = timeline
+                self.loading.discard(key)
+            self._log(f"Загружено строк ({source_tag}) для '{clean_t}': {len(timeline)}")
+            callback(timeline)
+
+        threading.Thread(target=_worker, daemon=True, name="lyrics_fetcher").start()
+
+
+class PetTouchListener(dynamic_proxy(View.OnTouchListener)):
+    def __init__(self, plugin):
+        super().__init__()
+        self.plugin = plugin
+
+    def onTouch(self, view, event):
+        try:
+            return bool(self.plugin._on_touch(event))
+        except Exception as e:
+            CLOG.log_error("TOUCH", "Touch error", e)
+            return False
+
+
+class ShakeListener(dynamic_proxy(SensorEventListener)):
+    def __init__(self, plugin):
+        super().__init__()
+        self.plugin = plugin
+
+    def onSensorChanged(self, event):
+        try:
+            v = event.values
+            self.plugin._on_accel(float(v[0]), float(v[1]), float(v[2]))
+        except Exception as e:
+            CLOG.log_error("SENSOR", "Sensor change error", e)
+
+    def onAccuracyChanged(self, sensor, accuracy):
+        pass
+
+
+class PoopClickListener(dynamic_proxy(View.OnClickListener)):
+    def __init__(self, plugin):
+        super().__init__()
+        self.plugin = plugin
+
+    def onClick(self, view):
+        try:
+            self.plugin._clean_poop(view)
+        except Exception as e:
+            CLOG.log_error("POOP", "Poop click error", e)
+
+
+class NewMessagesDelegate(dynamic_proxy(NotificationCenter.NotificationCenterDelegate)):
+    def __init__(self, plugin):
+        super().__init__()
+        self.plugin = plugin
+
+    def didReceivedNotification(self, id, account, args):
+        if self.plugin is None or self.plugin._msg_delegate is not self:
+            return
+        try:
+            self.plugin._on_notification(id, int(account), args)
+        except Exception as e:
+            CLOG.log_error("NOTIF", "Delegate error", e)
+
+
+class ClawdPetPlugin(BasePlugin):
+    def __init__(self):
+        super().__init__()
+        self._handler = None
+        self._tick_r = None
+        self._karaoke_switch_r = None
+        self._auto_return_r = None
+        self._running = False
+        self._paused = False
+        self._unloaded = False
+        self._cfg = {}
+
+        self._decor = None
+        self._pet = None
+        self._bubble = None
+        self._bubble_text = None
+        self._bubble_subtext = None
+        self._media_controls_layout = None
+        self._laser_view = None
+        self._touch_listener = None
+        self._msg_delegate = None
+        self._observed_accounts = []
+        self._chat_visits = {}
+
+        self._sensor_manager = None
+        self._sensor_listener = None
+        self._poop_listener = None
+
+        self._poops = []
+        self._particles = []
+        self._flying = []
+        self._eaten = []  # список словарей: view_ref, alpha, bmp, w, h, cls_name
+        self._spitting = []
+        self._recycler_listeners = []
+
+        self._unit = 1
+        self._w = 1
+        self._h = 1
+        self._frames = {}
+        self._particle_bitmaps = {}
+        self._frame_key = None
+
+        # Dirty flag кэш кадра
+        self._last_rendered_x = None
+        self._last_rendered_y = None
+        self._last_rendered_rot = None
+        self._last_rendered_frame_key = None
+
+        self._lyrics_helper = LyricsHelper(logger_cb=self._add_debug_log)
+        self._current_track_id = None
+        self._lyrics_timeline: List[Tuple[float, str]] = []
+        self._current_lyric_idx = -1
+        self._is_singing = False
+        self._test_karaoke_active = False
+
+        # Синхронизация и джиттер
+        self._track_base_pos = 0.0
+        self._track_base_time = 0.0
+        self._track_is_playing = False
+        self._user_offset = 0.0
+        self._session_offsets: Dict[str, float] = {}
+        self._position_known = True
+
+        # Clawd Bridge сетевой шлюз
+        self._bridge_thread = None
+        self._bridge_stop_event = threading.Event()
+        self._bridge_consecutive_errors = 0
+        self._bridge_interval = 0.38  # 350-400 мс штатный
+        self._bridge_last_ping_latency = 0.0
+        self._bridge_data: Optional[Dict[str, Any]] = None
+        self._bridge_lock = threading.Lock()
+
+        # Буфер обмена
+        self._last_checked_clip = ""
+        self._clip_check_time = 0.0
+
+        # Батарея и питание
+        self._battery_level = 100
+        self._is_charging = False
+        self._power_save_mode = False
+        self._last_battery_check = 0.0
+        self._nightstand_mode = False
+        self._laser_active = False
+
+        # Телеметрия производительности (60с сводка)
+        self._last_summary_time = time.monotonic()
+        self._tick_times = collections.deque(maxlen=120)
+        self._platform_scan_times = collections.deque(maxlen=20)
+        self._platforms_cache = []
+        self._last_platforms_scan_time = 0.0
+
+        self._reset_state()
+
+    def _add_debug_log(self, msg: str):
+        CLOG.log_info("APP", msg)
+
+    def on_plugin_load(self):
+        CLOG.log_info("LOAD", f"Загрузка Clawd v{__version__} by {__author__}...")
+        self._reload_cfg()
+        self._handler = Handler(Looper.getMainLooper())
+        self._tick_r = R(self._tick)
+        self._karaoke_switch_r = R(self._do_karaoke_line_switch)
+        self._auto_return_r = R(self._on_auto_return_triggered)
+
+        self.add_menu_item(
+            MenuItemData(
+                menu_type=MenuItemType.DRAWER_MENU,
+                text="Питомец Clawd",
+                on_click=self._on_menu_toggle,
+                item_id="clawd_toggle",
+                icon="msg_emoji_cat",
+            )
+        )
+        self.add_on_send_message_hook()
+        self._msg_delegate = NewMessagesDelegate(self)
+        self._on_ui(self._add_observers)
+        self._start_bridge_daemon()
+        run_on_ui_thread(lambda: self._start(greet=True))
+
+    def on_plugin_unload(self):
+        CLOG.log_info("UNLOAD", "Выгрузка Clawd v3.4...")
+        self._unloaded = True
+        self._running = False
+
+        # Остановка колбэков
+        if self._handler is not None:
+            if self._tick_r is not None:
+                self._handler.removeCallbacks(self._tick_r)
+            if self._karaoke_switch_r is not None:
+                self._handler.removeCallbacks(self._karaoke_switch_r)
+            if self._auto_return_r is not None:
+                self._handler.removeCallbacks(self._auto_return_r)
+
+        # Остановка фонового потока моста
+        self._stop_bridge_daemon()
+
+        delegate = self._msg_delegate
+        self._msg_delegate = None
+        accounts = self._observed_accounts
+        self._observed_accounts = []
+        self._on_ui(lambda: self._remove_observers(delegate, accounts))
+        self._on_ui(self._stop_sensor)
+        self._on_ui(self._detach_views)
+
+        # Сброс логов на диск
+        CLOG.flush_and_stop()
+
+    def _start_bridge_daemon(self):
+        if self._bridge_thread is not None and self._bridge_thread.is_alive():
+            return
+        self._bridge_stop_event.clear()
+        self._bridge_thread = threading.Thread(target=self._bridge_worker, daemon=True, name="clawd_bridge_client")
+        self._bridge_thread.start()
+        CLOG.log_info("BRIDGE", "Поток Clawd Bridge запущен: опрос 350-400 мс")
+
+    def _stop_bridge_daemon(self):
+        self._bridge_stop_event.set()
+        if self._bridge_thread and self._bridge_thread.is_alive():
+            self._bridge_thread.join(timeout=0.6)
+        self._bridge_thread = None
+
+    def _bridge_worker(self):
+        url = "http://127.0.0.1:44444/now-playing"
+        while not self._bridge_stop_event.is_set():
+            t0 = time.monotonic()
+            success = False
+            data = None
+            try:
+                # Таймаут: connect=200ms, read=500ms -> timeout=0.5s
+                req = urllib.request.Request(
+                    url,
+                    headers={
+                        "User-Agent": "ClawdPet/3.4 (Android)",
+                        "Host": "127.0.0.1:44444",
+                    },
+                )
+                with urllib.request.urlopen(req, timeout=0.5) as resp:
+                    if resp.status == 200:
+                        raw = resp.read().decode("utf-8")
+                        data = json.loads(raw)
+                        success = True
+            except Exception as e:
+                # HTTP ошибка соединения
+                pass
+
+            dt_ping = (time.monotonic() - t0) * 1000.0
+            self._bridge_last_ping_latency = dt_ping
+
+            if success and data:
+                if self._bridge_consecutive_errors >= 5:
+                    CLOG.log_info("BRIDGE", f"Связь восстановлена (200 OK)! Сброс backoff на {self._bridge_interval*1000:.0f} мс")
+                self._bridge_consecutive_errors = 0
+                self._bridge_interval = random.uniform(0.35, 0.40)
+                with self._bridge_lock:
+                    self._bridge_data = data
+            else:
+                self._bridge_consecutive_errors += 1
+                if self._bridge_consecutive_errors == 5:
+                    self._bridge_interval = 3.0
+                    CLOG.log_warn("BRIDGE", "5 ошибок связи подряд! Переход в ступенчатый backoff на 3.0 секунды")
+                elif self._bridge_consecutive_errors > 5:
+                    self._bridge_interval = 3.0
+
+                # Резервный файл sync.json
+                fallback_data = self._read_fallback_sync_json()
+                with self._bridge_lock:
+                    self._bridge_data = fallback_data
+
+            time.sleep(self._bridge_interval)
+
+    def _read_fallback_sync_json(self) -> Optional[Dict[str, Any]]:
+        if not CLOG.base_dir:
+            return None
+        sync_fp = os.path.join(CLOG.base_dir, "sync.json")
+        try:
+            if not os.path.exists(sync_fp):
+                return None
+            with open(sync_fp, "r", encoding="utf-8") as f:
+                d = json.load(f)
+            ts = float(d.get("timestamp", 0))
+            # Считывается только если timestamp внутри файла не старше 5 секунд!
+            if abs(time.time() - ts) <= 5.0:
+                # Извлекаются исключительно artist и title для поиска текста!
+                return {
+                    "has_media": True,
+                    "is_playing": True,
+                    "player": d.get("player", "sync_file"),
+                    "artist": d.get("artist", ""),
+                    "title": d.get("title", ""),
+                    "position_ms": 0,
+                    "duration_ms": 0,
+                    "position_known": False,
+                    "timestamp": ts,
+                    "is_fallback": True,
+                }
+        except Exception:
+            pass
+        return None
+
+    def _add_observers(self):
+        delegate = self._msg_delegate
+        if delegate is None or self._unloaded:
+            return
+        for account in range(16):
+            try:
+                nc = NotificationCenter.getInstance(account)
+                for ev_name in ("didReceiveNewMessages", "messagesRead", "messagesDeleted"):
+                    ev_id = getattr(NotificationCenter, ev_name, None)
+                    if ev_id is not None:
+                        nc.addObserver(delegate, ev_id)
+                self._observed_accounts.append(account)
+            except Exception:
+                break
+
+    def _remove_observers(self, delegate, accounts):
+        if delegate is None:
+            return
+        for account in accounts:
+            try:
+                nc = NotificationCenter.getInstance(account)
+                for ev_name in ("didReceiveNewMessages", "messagesRead", "messagesDeleted"):
+                    ev_id = getattr(NotificationCenter, ev_name, None)
+                    if ev_id is not None:
+                        nc.removeObserver(delegate, ev_id)
+            except Exception as e:
+                CLOG.log_error("OBSERVER", "Remove observer error", e)
+
+    def on_send_message_hook(self, account, params):
+        try:
+            text = getattr(params, "message", None)
+            length = len(str(text)) if text is not None else 0
+            run_on_ui_thread(lambda: self._on_sent(length, account))
+        except Exception as e:
+            CLOG.log_error("HOOK", "Send hook error", e)
+        return HookResult()
+
+    def on_app_event(self, event_type):
+        if event_type == AppEvent.PAUSE:
+            self._paused = True
+            if self._handler is not None:
+                if self._tick_r is not None:
+                    self._handler.removeCallbacks(self._tick_r)
+                if self._karaoke_switch_r is not None:
+                    self._handler.removeCallbacks(self._karaoke_switch_r)
+                if self._auto_return_r is not None:
+                    self._handler.removeCallbacks(self._auto_return_r)
+            self._on_ui(self._stop_sensor)
+            # Принудительный возврат съеденного при PAUSE
+            self._on_ui(self._give_back)
+        elif event_type == AppEvent.RESUME:
+            self._paused = False
+            run_on_ui_thread(lambda: self._start(greet=False))
+
+    def create_settings(self) -> List[Any]:
+        pets = int(self.get_setting("pets_count", 0) or 0)
+        eaten = int(self.get_setting("eaten_count", 0) or 0)
+        cleaned = int(self.get_setting("poops_cleaned", 0) or 0)
+        return [
+            Header(text="Питомец Clawd v3.4"),
+            Switch(
+                key="show",
+                text="Показывать питомца",
+                default=True,
+                subtext="Также включается в боковом меню Telegram",
+                icon="msg_emoji_cat",
+                on_change=lambda v: self._on_cfg_change("show", v),
+            ),
+            Selector(
+                key="size",
+                text="Размер",
+                default=1,
+                items=SIZE_ITEMS,
+                icon="msg_photo_settings",
+                on_change=lambda v: self._on_cfg_change("size", v),
+            ),
+            Selector(
+                key="color",
+                text="Окрас (11 стилей)",
+                default=0,
+                items=[p[0] for p in PALETTES],
+                icon="msg_colors",
+                on_change=lambda v: self._on_cfg_change("color", v),
+            ),
+            Selector(
+                key="hat",
+                text="Головной убор (11 шапок)",
+                default=0,
+                items=HATS,
+                icon="msg_channel",
+                on_change=lambda v: self._on_cfg_change("hat", v),
+            ),
+            Header(text="Караоке и Clawd Bridge 🎵"),
+            Switch(
+                key="dance",
+                text="Реагировать на музыку",
+                default=True,
+                subtext="Танцевать под треки Telegram и Clawd Bridge (30 fps)",
+                icon="msg_voice_headphones",
+                on_change=lambda v: self._on_cfg_change("dance", v),
+            ),
+            Switch(
+                key="karaoke",
+                text="Синхронное караоке",
+                default=True,
+                subtext="LRCLIB + NetEase + архив Lyrics/ + кнопка выбора строки [📋]",
+                icon="msg_discussion",
+                on_change=lambda v: self._on_cfg_change("karaoke", v),
+            ),
+            Switch(
+                key="media_controls",
+                text="Пульт управления в облачке",
+                default=True,
+                subtext="Кнопки [⏮], [⏯], [⏭] и [📋] прямо над питомцем",
+                icon="msg_round_play",
+                on_change=lambda v: self._on_cfg_change("media_controls", v),
+            ),
+            Switch(
+                key="clipboard_sync",
+                text="Автоперехват из буфера (SoundCloud)",
+                default=False,
+                subtext="Поёт скопированные ссылки SoundCloud (по умолчанию выкл)",
+                icon="msg_copy",
+                on_change=lambda v: self._on_cfg_change("clipboard_sync", v),
+            ),
+            Switch(
+                key="sc_autostart_incoming",
+                text="Автозапуск SoundCloud из чатов",
+                default=False,
+                subtext="Запускать караоке при ссылках в сообщениях (по умолчанию выкл)",
+                icon="msg_link",
+                on_change=lambda v: self._on_cfg_change("sc_autostart_incoming", v),
+            ),
+            Header(text="Поведение и «Абсолютный Обжора» 2.0"),
+            Switch(
+                key="eat",
+                text="«Абсолютный Обжора» 2.0",
+                default=True,
+                subtext="Безопасно ест любой View (до 12 шт), не ломает списки",
+                icon="msg_emoji_food",
+                on_change=lambda v: self._on_cfg_change("eat", v),
+            ),
+            Selector(
+                key="auto_return",
+                text="Автовозврат съеденного",
+                default=1,
+                items=AUTO_RETURN_ITEMS,
+                icon="msg_reset",
+                on_change=lambda v: self._on_cfg_change("auto_return", v),
+            ),
+            Switch(
+                key="tg_events",
+                text="Реакции Telegram",
+                default=True,
+                subtext="Разделяет заметки Избранного и входящие от других лиц",
+                icon="msg_notifications",
+                on_change=lambda v: self._on_cfg_change("tg_events", v),
+            ),
+            Switch(
+                key="battery_react",
+                text="Реакция на батарею",
+                default=True,
+                subtext="Устает при <15%, заряжается искрами у розетки",
+                icon="msg_customize",
+                on_change=lambda v: self._on_cfg_change("battery_react", v),
+            ),
+            Switch(
+                key="gravity",
+                text="Гравитация на всех экранах",
+                default=False,
+                subtext="Прыгает по карточкам настроек, чатам и подтягивается",
+                icon="msg_download",
+                on_change=lambda v: self._on_cfg_change("gravity", v),
+            ),
+            Switch(
+                key="poop",
+                text="Какает (с шансом на золото)",
+                default=True,
+                subtext="Оставляет кучки после съеденного UI",
+                icon="msg_clear",
+                on_change=lambda v: self._on_cfg_change("poop", v),
+            ),
+            Switch(
+                key="shake",
+                text="Чувствует тряску + Шар предсказаний",
+                default=True,
+                subtext="Инерционный полёт по вектору и ответы оракула 🎱",
+                icon="msg_photo_rotate",
+                on_change=lambda v: self._on_cfg_change("shake", v),
+            ),
+            Selector(
+                key="log_level",
+                text="Уровень логирования",
+                default=1,
+                items=LOG_LEVELS,
+                icon="msg_log",
+                on_change=lambda v: self._on_cfg_change("log_level", v),
+            ),
+            Header(text="🧪 Тестирование и Отладка"),
+            Text(
+                text="🧪 Тестовый полигон (12 тестов)",
+                subtext="Проверить анимации, Clawd Bridge, Tap-to-Sync, обжору и датчики",
+                icon="msg_diagnostic",
+                accent=True,
+                on_click=lambda _v=None: run_on_ui_thread(self._open_test_sandbox),
+            ),
+            Text(
+                text="Открыть логи (Downloads/ClaudePet/*.txt)",
+                subtext=f"Записей в буфере: {len(CLOG.ring_buffer)}",
+                icon="msg_log",
+                on_click=lambda _v=None: run_on_ui_thread(self._show_logs_dialog),
+            ),
+            Text(
+                text="Скопировать отчёт системы 📋",
+                subtext="Формирует дамп настроек, моста и последних 200 строк",
+                icon="msg_copy",
+                on_click=lambda _v=None: run_on_ui_thread(self._copy_system_report),
+            ),
+            Text(
+                text="Почистить кэш Telegram с метлой 🧹",
+                subtext="Выметает мусор и освобождает память",
+                icon="msg_clear",
+                on_click=lambda _v=None: run_on_ui_thread(self._trigger_clean_cache),
+            ),
+            Divider(),
+            Text(
+                text="Позвать в центр экрана",
+                icon="msg_retry",
+                on_click=lambda _view=None: run_on_ui_thread(self._recenter),
+            ),
+            Text(
+                text="Вернуть съеденное (Выплюнуть всё)",
+                icon="msg_reset",
+                on_click=lambda _view=None: run_on_ui_thread(self._give_back),
+            ),
+            Text(
+                text="Погладили",
+                subtext=f"{pets} раз",
+                icon="msg_reactions",
+            ),
+            Text(
+                text="Съедено элементов",
+                subtext=f"{eaten} шт.",
+                icon="msg_stats",
+            ),
+            Text(
+                text="Убрано кучек",
+                subtext=f"{cleaned} шт.",
+                icon="msg_delete",
+            ),
+        ]
+
+    def _get_safe_activity(self):
+        try:
+            fragment = get_last_fragment()
+            if fragment is not None:
+                act = fragment.getParentActivity()
+                if act is not None:
+                    return act
+        except Exception:
+            pass
+        try:
+            return LaunchActivity.instance
+        except Exception:
+            return None
+
+    def _open_test_sandbox(self):
+        try:
+            ctx = self._get_safe_activity()
+            if not ctx:
+                return
+
+            tests = [
+                ("1. Тест рук (Машет обеими)", "Clawd машет по очереди левой, правой и поднимает обе"),
+                ("2. Тест всех эмоций", "Радость, шок, сон, злость, головокружение, глаза-$"),
+                ("3. Тест Clawd Bridge (Шлюз)", "Проверка подключения к 127.0.0.1:44444 и backoff"),
+                ("4. Тест караоке (Автономное Демо)", "Запуск трека со словами и проверка джиттер-фильтра"),
+                ("5. Тест «Обжоры» (Шаг веса)", "Съедает элемент с WeakReference и полнеет на 1 стадию"),
+                ("6. Тест выплёвывания", "Возвращает всё съеденное на экран без пустых мест"),
+                ("7. Тест лазера", "Спавнит точку лазера и бежит за ней"),
+                ("8. Тест шара предсказаний 🎱", "Показывает случайный ответ оракула"),
+                ("9. Тест тряски (Инерция)", "Бросок питомца по вектору движения"),
+                ("10. Тест Telegram: Входящее сообщение", "Эмуляция сообщения от собеседника"),
+                ("11. Тест Telegram: Заметка в Избранное", "Эмуляция отправки сообщения себе"),
+                ("12. Тест батареи: <15% и Зарядка", "Переключает режимы энергии"),
+            ]
+
+            b = AlertDialog.Builder(ctx)
+            b.setTitle("Тестовый полигон Clawd v3.4")
+            items = [f"{t[0]}\n• {t[1]}" for t in tests]
+
+            def _on_click(_d, which):
+                self._run_test_action(which)
+
+            b.setItems(items, DialogClickListener(_on_click))
+            b.setPositiveButton("Закрыть", None)
+            b.show()
+        except Exception as e:
+            CLOG.log_error("SANDBOX", "Open sandbox error", e)
+
+    def _run_test_action(self, index: int):
+        now = time.monotonic()
+        if index == 0:
+            self._wave_until = now + 2.5
+            self._set_expr("happy", 2.0)
+            self._hop(self._dp(450))
+            self._say("hello", force=True)
+        elif index == 1:
+            exprs = ["happy", "surprised", "angry", "dizzy", "money", "sleep"]
+            for i, ex in enumerate(exprs):
+                self._handler.postDelayed(R(lambda e=ex: self._set_expr(e, 1.0)), i * 600)
+        elif index == 2:
+            status = "В бэкоффе (3.0с)" if self._bridge_consecutive_errors >= 5 else f"Активен ({self._bridge_interval*1000:.0f} мс)"
+            errs = self._bridge_consecutive_errors
+            ping = self._bridge_last_ping_latency
+            self._say(f"Bridge: {status}, пинг {ping:.1f}мс, ошибок: {errs}", force=True)
+            self._hop(self._dp(400))
+        elif index == 3:
+            # Автономное демо караоке с виртуальным таймером
+            self._test_karaoke_active = True
+            self._start_custom_song("Kai Angel - andy warhol")
+        elif index == 4:
+            self._try_eat(now, 0.0)
+        elif index == 5:
+            self._give_back()
+        elif index == 6:
+            self._laser_active = True
+            lx = self._x + self._dp(80)
+            ly = self._y
+            self._run_towards(lx, ly)
+            self._say("laser_chase", force=True)
+            self._handler.postDelayed(R(lambda: setattr(self, "_laser_active", False)), 2500)
+        elif index == 7:
+            self._trigger_magic_8ball(now)
+        elif index == 8:
+            self._apply_shake_vector(-16.0, -12.0)
+        elif index == 9:
+            self._react_incoming(None, in_chat=False, sender_name="Иван")
+        elif index == 10:
+            self._say("sent_self", force=True)
+            self._hop(self._dp(400))
+        elif index == 11:
+            self._battery_level = 9
+            self._say("battery_low", force=True)
+            self._handler.postDelayed(R(lambda: self._trigger_fake_charge()), 2000)
+
+    def _trigger_fake_charge(self):
+        self._battery_level = 100
+        self._is_charging = True
+        self._say("charging", force=True)
+        self._hop(self._dp(450))
+        for _ in range(4):
+            self._spawn_particle("spark")
+
+    def _show_logs_dialog(self):
+        try:
+            ctx = self._get_safe_activity()
+            if not ctx:
+                return
+
+            # Читаем из кольцевого буфера
+            lines = list(CLOG.ring_buffer)[-50:]
+            content = "=== КОЛЬЦЕВОЙ БУФЕР В ПАМЯТИ (500 строк) ===\n" + "\n".join(lines)
+
+            b = AlertDialog.Builder(ctx)
+            b.setTitle("Журнал диагностики Clawd")
+            scroll = ScrollView(ctx)
+            tv = TextView(ctx)
+            tv.setPadding(AndroidUtilities.dp(16), AndroidUtilities.dp(8), AndroidUtilities.dp(16), AndroidUtilities.dp(8))
+            tv.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 11.5)
+            tv.setText(content)
+            tv.setTextIsSelectable(True)
+            scroll.addView(tv)
+            b.setView(scroll)
+            b.setPositiveButton("Закрыть", None)
+            b.setNeutralButton("Скопировать всё", TGDialogClickListener(lambda _d, _w: self._copy_system_report()))
+            b.show()
+        except Exception as e:
+            CLOG.log_error("LOGS_UI", "Show logs error", e)
+
+    def _copy_system_report(self):
+        try:
+            ctx = self._get_safe_activity()
+            if not ctx:
+                return
+            cm = ctx.getSystemService(Context.CLIPBOARD_SERVICE)
+            if not cm:
+                return
+
+            last_lines = list(CLOG.ring_buffer)[-200:]
+            report = (
+                f"=== ДАМП СИСТЕМЫ CLAWD v{__version__} ===\n"
+                f"Время: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                f"Статус моста: errors={self._bridge_consecutive_errors}, interval={self._bridge_interval*1000:.0f}ms, latency={self._bridge_last_ping_latency:.1f}ms\n"
+                f"Текущий трек: {self._current_track_id}\n"
+                f"Смещение _user_offset: {self._user_offset:.3f} с\n"
+                f"Полнота желудка: {len(self._eaten)}/12 (стадия {self._fat_stage()})\n"
+                f"Батарея: {self._battery_level}% (зарядка={self._is_charging}, эконом={self._power_save_mode})\n"
+                f"\n=== ПОСЛЕДНИЕ 200 СТРОК ЛОГА ===\n"
+                + "\n".join(last_lines)
+            )
+
+            clip = ClipData.newPlainText("Clawd Diagnostics Report", report)
+            cm.setPrimaryClip(clip)
+            self._say("Отчёт скопирован в буфер! 📋", force=True)
+            self._hop(self._dp(400))
+        except Exception as e:
+            CLOG.log_error("REPORT", "Report copy error", e)
+
+    def _trigger_clean_cache(self):
+        try:
+            self._say("clean_cache", force=True)
+            self._hop(self._dp(450))
+            for _ in range(4):
+                self._spawn_particle("spark")
+            System = jclass("java.lang.System")
+            System.gc()
+            CLOG.log_info("CACHE", "Очистка кэша завершена успешно")
+        except Exception as e:
+            CLOG.log_error("CACHE", "Cache clean error", e)
+
+    def _dispatch_media_key(self, key_code: int):
+        try:
+            ctx = self._pet.getContext() if self._pet else LaunchActivity.instance
+            if not ctx:
+                return
+            am = ctx.getSystemService(Context.AUDIO_SERVICE)
+            if am:
+                am.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, key_code))
+                am.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_UP, key_code))
+                self._hop(self._dp(200))
+        except Exception as e:
+            CLOG.log_error("MEDIA_KEY", "Key dispatch error", e)
+
+    def _reload_cfg(self):
+        log_lvl_idx = clamp(int(self.get_setting("log_level", 1) or 0), 0, len(LOG_LEVELS) - 1)
+        CLOG.min_level_str = LOG_LEVELS[log_lvl_idx]
+
+        self._cfg = {
+            "show": bool(self.get_setting("show", True)),
+            "size": int(self.get_setting("size", 1) or 0),
+            "color": int(self.get_setting("color", 0) or 0),
+            "hat": int(self.get_setting("hat", 0) or 0),
+            "gravity": bool(self.get_setting("gravity", False)),
+            "wander": bool(self.get_setting("wander", True)),
+            "phrases": bool(self.get_setting("phrases", True)),
+            "sleep": int(self.get_setting("sleep", 1) or 0),
+            "haptics": bool(self.get_setting("haptics", True)),
+            "eat": bool(self.get_setting("eat", True)),
+            "auto_return": int(self.get_setting("auto_return", 1) or 0),
+            "tg_events": bool(self.get_setting("tg_events", True)),
+            "dance": bool(self.get_setting("dance", True)),
+            "karaoke": bool(self.get_setting("karaoke", True)),
+            "media_controls": bool(self.get_setting("media_controls", True)),
+            "battery_react": bool(self.get_setting("battery_react", True)),
+            "clipboard_sync": bool(self.get_setting("clipboard_sync", False)),
+            "sc_autostart_incoming": bool(self.get_setting("sc_autostart_incoming", False)),
+            "poop": bool(self.get_setting("poop", True)),
+            "shake": bool(self.get_setting("shake", True)),
+            "log_level": log_lvl_idx,
+        }
+
+    def _on_cfg_change(self, key, value):
+        self._cfg[key] = value
+        if key == "show":
+            run_on_ui_thread(lambda: self._apply_show(bool(value)))
+        elif key in ("size", "color", "hat"):
+            run_on_ui_thread(self._rebuild_sprites)
+        elif key == "eat" and not value:
+            run_on_ui_thread(self._give_back)
+        elif key == "poop" and not value:
+            run_on_ui_thread(self._remove_poops)
+        elif key == "shake":
+            run_on_ui_thread(self._start_sensor if value else self._stop_sensor)
+        elif key == "log_level":
+            idx = clamp(int(value), 0, len(LOG_LEVELS) - 1)
+            CLOG.min_level_str = LOG_LEVELS[idx]
+
+    def _on_menu_toggle(self, context=None):
+        show = not self._cfg.get("show", True)
+        self._cfg["show"] = show
+        self.set_setting("show", show)
+        run_on_ui_thread(lambda: self._apply_show(show))
+
+    def _apply_show(self, show):
+        if show:
+            self._start(greet=True)
+        else:
+            self._running = False
+            if self._handler is not None:
+                self._handler.removeCallbacks(self._tick_r)
+            self._stop_sensor()
+            self._detach_views()
+
+    def _on_ui(self, fn):
+        try:
+            if Looper.myLooper() == Looper.getMainLooper():
+                fn()
+                return
+        except Exception:
+            pass
+        run_on_ui_thread(fn)
+
+    def _start(self, greet):
+        if self._unloaded or self._paused or not self._cfg.get("show", True):
+            return
+        if greet:
+            self._greet_pending = True
+        try:
+            self._ensure_attached()
+        except Exception as e:
+            CLOG.log_error("START", "Attach error", e)
+        if self._pet is None:
+            run_on_ui_thread(lambda: self._start(greet), 700)
+            return
+        self._running = True
+        self._last_tick = time.monotonic()
+        self._start_sensor()
+        self._schedule(16)
+
+    def _start_sensor(self):
+        if (
+            self._sensor_listener is not None
+            or not self._running
+            or self._paused
+            or self._unloaded
+            or not self._cfg.get("shake", True)
+            or self._pet is None
+        ):
+            return
+        try:
+            manager = self._pet.getContext().getSystemService(Context.SENSOR_SERVICE)
+            sensor = manager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER) if manager is not None else None
+            if sensor is None:
+                return
+            listener = ShakeListener(self)
+            if manager.registerListener(listener, sensor, SensorManager.SENSOR_DELAY_UI):
+                self._sensor_manager = manager
+                self._sensor_listener = listener
+                self._accel_prev = None
+                self._shake_hits = []
+                CLOG.log_info("SENSOR", "Акселерометр успешно подключен")
+        except Exception as e:
+            CLOG.log_error("SENSOR", "Sensor start error", e)
+
+    def _stop_sensor(self):
+        manager = self._sensor_manager
+        listener = self._sensor_listener
+        self._sensor_manager = None
+        self._sensor_listener = None
+        self._tilt = 0.0
+        if manager is None or listener is None:
+            return
+        try:
+            manager.unregisterListener(listener)
+        except Exception as e:
+            CLOG.log_error("SENSOR", "Sensor stop error", e)
+
+    def _ensure_attached(self):
+        activity = self._get_safe_activity()
+        if activity is None or activity.isFinishing():
+            return
+        decor = activity.getWindow().getDecorView()
+        if (
+            self._pet is not None
+            and self._decor is not None
+            and self._pet.getParent() is not None
+            and self._decor.equals(decor)
+        ):
+            return
+        # При смене экрана/фрагмента — принудительный возврат съеденного
+        self._give_back()
+        self._detach_views()
+        self._decor = decor
+        self._build_views(activity)
+
+    def _build_views(self, context):
+        self._update_metrics()
+        pet = ImageView(context)
+        pet.setScaleType(ImageView.ScaleType.FIT_XY)
+        pet.setClickable(True)
+        self._touch_listener = PetTouchListener(self)
+        pet.setOnTouchListener(self._touch_listener)
+        self._decor.addView(pet, FrameLayout.LayoutParams(self._w, self._h))
+        self._pet = pet
+
+        bubble_layout = LinearLayout(context)
+        bubble_layout.setOrientation(LinearLayout.VERTICAL)
+        bubble_layout.setPadding(
+            AndroidUtilities.dp(12), AndroidUtilities.dp(7),
+            AndroidUtilities.dp(12), AndroidUtilities.dp(7),
+        )
+        bubble_layout.setVisibility(View.GONE)
+
+        bubble_text = TextView(context)
+        bubble_text.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 13.0)
+        bubble_text.setMaxWidth(AndroidUtilities.dp(250))
+        try:
+            bubble_text.setTypeface(AndroidUtilities.bold())
+        except Exception:
+            pass
+        bubble_layout.addView(bubble_text, LinearLayout.LayoutParams(-2, -2))
+
+        bubble_subtext = TextView(context)
+        bubble_subtext.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 10.5)
+        bubble_subtext.setMaxWidth(AndroidUtilities.dp(250))
+        bubble_subtext.setAlpha(0.55)
+        bubble_subtext.setVisibility(View.GONE)
+        bubble_layout.addView(bubble_subtext, LinearLayout.LayoutParams(-2, -2))
+
+        controls = LinearLayout(context)
+        controls.setOrientation(LinearLayout.HORIZONTAL)
+        controls.setGravity(Gravity.CENTER)
+        controls.setPadding(0, AndroidUtilities.dp(4), 0, 0)
+        controls.setVisibility(View.GONE)
+
+        def _make_btn(symbol: str, cb):
+            btn = TextView(context)
+            btn.setText(symbol)
+            btn.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 14.0)
+            btn.setPadding(AndroidUtilities.dp(8), 0, AndroidUtilities.dp(8), 0)
+            btn.setOnClickListener(ViewClickListener(lambda _v: cb()))
+            return btn
+
+        # Пульт управления: кнопки [-3s] и [+3s] удалены, добавлена кнопка [📋]
+        controls.addView(_make_btn("⏮", lambda: self._dispatch_media_key(KeyEvent.KEYCODE_MEDIA_PREVIOUS)))
+        controls.addView(_make_btn("⏯", lambda: self._dispatch_media_key(KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE)))
+        controls.addView(_make_btn("⏭", lambda: self._dispatch_media_key(KeyEvent.KEYCODE_MEDIA_NEXT)))
+        controls.addView(_make_btn("📋", lambda: self._open_tap_to_sync_dialog()))
+        bubble_layout.addView(controls, LinearLayout.LayoutParams(-1, -2))
+
+        self._decor.addView(bubble_layout, FrameLayout.LayoutParams(-2, -2))
+        self._bubble = bubble_layout
+        self._bubble_text = bubble_text
+        self._bubble_subtext = bubble_subtext
+        self._media_controls_layout = controls
+        self._bubble_visible = False
+        self._frame_key = None
+        self._pos_ready = False
+
+    def _detach_views(self):
+        self._restore_all()
+        self._remove_poops()
+        for view in list(self._particles):
+            self._remove_view(view)
+        self._particles = []
+        self._remove_view(self._bubble)
+        self._remove_view(self._pet)
+        self._pet = None
+        self._bubble = None
+        self._bubble_text = None
+        self._bubble_subtext = None
+        self._media_controls_layout = None
+        self._decor = None
+        self._touch_listener = None
+        self._poop_listener = None
+        self._touch = None
+        self._platform = None
+        self._platforms = []
+        if self._state in ("press", "drag", "pet", "hang", "peek"):
+            self._state = "idle"
+
+    def _remove_view(self, view):
+        if view is None:
+            return
+        try:
+            view.animate().cancel()
+        except Exception:
+            pass
+        try:
+            parent = view.getParent()
+            if parent is not None:
+                parent.removeView(view)
+        except Exception:
+            pass
+
+    def _update_metrics(self):
+        size = clamp(int(self._cfg.get("size", 1)), 0, len(SIZE_DP) - 1)
+        self._unit = max(2, AndroidUtilities.dp(SIZE_DP[size]))
+        self._w = GRID_W * self._unit
+        self._h = GRID_H * self._unit
+
+    def _rebuild_sprites(self):
+        old_w, old_h = self._w, self._h
+        self._frames = {}
+        self._particle_bitmaps = {}
+        self._frame_key = None
+        self._last_rendered_frame_key = None
+        self._update_metrics()
+        if self._pet is None:
+            return
+        self._x += (old_w - self._w) / 2.0
+        self._y += old_h - self._h
+        lp = self._pet.getLayoutParams()
+        lp.width = self._w
+        lp.height = self._h
+        self._pet.setLayoutParams(lp)
+        self._hop(AndroidUtilities.dp(300))
+        self._schedule(16)
+
+    def _palette(self):
+        idx = clamp(int(self._cfg.get("color", 0)), 0, len(PALETTES) - 1)
+        if idx == 9:
+            hue = (time.monotonic() * 0.4) % 1.0
+            r, g, b = [int(x * 255) for x in self._hsv_to_rgb(hue, 0.85, 0.95)]
+            return ("RGB", (0xFF << 24) | (r << 16) | (g << 8) | b, 0xFFFFFFFF)
+        if idx == 10:
+            accent = Theme.getColor(Theme.key_actionBarDefault)
+            return ("Хамелеон", accent, 0xFFFFFFFF)
+        return PALETTES[idx]
+
+    @staticmethod
+    def _hsv_to_rgb(h, s, v):
+        i = int(h * 6.0)
+        f = (h * 6.0) - i
+        p = v * (1.0 - s)
+        q = v * (1.0 - s * f)
+        t = v * (1.0 - s * (1.0 - f))
+        i = i % 6
+        if i == 0: return v, t, p
+        if i == 1: return q, v, p
+        if i == 2: return p, v, t
+        if i == 3: return p, q, v
+        if i == 4: return t, p, v
+        if i == 5: return v, p, q
+        return v, v, v
+
+    def _get_frame(self, key):
+        bmp = self._frames.get(key)
+        if bmp is None:
+            if len(self._frames) >= MAX_FRAME_CACHE:
+                self._frames.pop(next(iter(self._frames)))
+            bmp = self._render_frame(key)
+            self._frames[key] = bmp
+        return bmp
+
+    def _render_frame(self, key):
+        eyes, look, arms, legs, squash, blush, mouth, hat, fat_stage, color_signature = key
+        _, body_color, eye_color = self._palette()
+        blush_color = mix_color(body_color, 0xFFFF4F79, 0.5)
+        s = self._unit
+        bmp = Bitmap.createBitmap(GRID_W * s, GRID_H * s, Bitmap.Config.ARGB_8888)
+        canvas = Canvas(bmp)
+        paint = Paint()
+
+        def px(x0, y0, x1, y1, color):
+            paint.setColor(jint(as_java_color(color)))
+            canvas.drawRect(float(x0 * s), float(y0 * s), float(x1 * s), float(y1 * s), paint)
+
+        # 4 стадии полноты «Обжоры»: 0: normal, 1: chubby, 2: fat, 3: balloon
+        width_pad = [0, 1, 2, 3][fat_stage]
+        left = max(0, 3 - width_pad)
+        right = min(GRID_W, 15 + width_pad)
+        top, bottom = 3, 10
+
+        if squash > 0:
+            left = max(0, left - 1)
+            right = min(GRID_W, right + 1)
+            top += 2
+        elif squash < 0:
+            top -= 1
+
+        heights = {
+            "stand": (2, 2, 2, 2),
+            "walk1": (1, 2, 1, 2),
+            "walk2": (2, 1, 2, 1),
+            "dangle": (3, 3, 3, 3),
+            "tuck": (1, 1, 1, 1),
+        }.get(legs, (2, 2, 2, 2))
+
+        col_coords = (left + 1, left + 3, right - 4, right - 2)
+        for col, h in zip(col_coords, heights):
+            px(col, bottom, col + 1, bottom + h, body_color)
+
+        def arm(side, style):
+            if style == "up":
+                if side < 0:
+                    px(left - 2, top - 1, left - 1, top + 3, body_color)
+                    px(left - 1, top + 2, left, top + 3, body_color)
+                else:
+                    px(right + 1, top - 1, right + 2, top + 3, body_color)
+                    px(right, top + 2, right + 1, top + 3, body_color)
+            elif style == "tuck":
+                if side < 0:
+                    px(left - 1, top + 3, left, top + 5, body_color)
+                else:
+                    px(right, top + 3, right + 1, top + 5, body_color)
+            else:
+                if side < 0:
+                    px(left - 2, top + 3, left, top + 5, body_color)
+                else:
+                    px(right, top + 3, right + 2, top + 5, body_color)
+
+        left_arm = right_arm = arms
+        if arms == "wave1":
+            left_arm, right_arm = "up", "normal"
+        elif arms == "wave2":
+            left_arm, right_arm = "normal", "up"
+        arm(-1, left_arm)
+        arm(1, right_arm)
+
+        px(left, top, right, bottom, body_color)
+
+        # Глаза
+        ey = top + 2
+        for side, cx in ((-1, left + 3 + look), (1, right - 4 + look)):
+            if eyes == "blink":
+                px(cx, ey + 1, cx + 1, ey + 2, eye_color)
+            elif eyes == "happy":
+                px(cx - 1, ey + 1, cx, ey + 2, eye_color)
+                px(cx, ey, cx + 1, ey + 1, eye_color)
+                px(cx + 1, ey + 1, cx + 2, ey + 2, eye_color)
+            elif eyes == "surprised":
+                px(cx, ey - 1, cx + 1, ey + 2, eye_color)
+            elif eyes == "dizzy":
+                for dx, dy in ((-1, -1), (1, -1), (0, 0), (-1, 1), (1, 1)):
+                    px(cx + dx, ey + dy, cx + dx + 1, ey + dy + 1, eye_color)
+            elif eyes == "sleep":
+                px(cx - 1, ey + 1, cx + 2, ey + 2, eye_color)
+            elif eyes == "money":
+                px(cx, ey - 1, cx + 1, ey + 2, 0xFF4CAF50)
+                px(cx - 1, ey, cx + 2, ey + 1, 0xFF4CAF50)
+            elif eyes == "angry":
+                px(cx, ey, cx + 1, ey + 2, eye_color)
+                brow = cx - 1 if side < 0 else cx + 1
+                px(brow, ey - 1, brow + 1, ey, eye_color)
+            else:
+                px(cx, ey, cx + 1, ey + 2, eye_color)
+
+            if blush or fat_stage >= 1:
+                bx = cx - 2 if side < 0 else cx + 1
+                px(bx, ey + 2, bx + 2, ey + 3, blush_color)
+
+        # Рот
+        if mouth:
+            mx = (left + right) // 2
+            my = ey + 2
+            if mouth == "open":
+                px(mx - 1, my, mx + 1, bottom - 1, eye_color)
+            else:
+                px(mx - 1, my, mx + 1, my + 1, eye_color)
+
+        # Шапки
+        if "Наушники DJ" in hat or (self._media == "music" and "Корона" not in hat):
+            px(left + 2, top - 2, right - 2, top - 1, 0xFF2A2A2A)
+            px(left - 1, top, left, top + 4, 0xFFFF4444)
+            px(right, top, right + 1, top + 4, 0xFFFF4444)
+        elif "Корона" in hat:
+            gold = 0xFFFFD700
+            px(left + 2, top - 2, right - 2, top, gold)
+            px(left + 2, top - 3, left + 3, top - 2, gold)
+            px((left + right) // 2, top - 3, (left + right) // 2 + 1, top - 2, gold)
+            px(right - 3, top - 3, right - 2, top - 2, gold)
+        elif "Шерлок" in hat:
+            brown = 0xFF8D6E63
+            px(left - 1, top - 1, right + 1, top, brown)
+            px(left + 2, top - 3, right - 2, top - 1, brown)
+        elif "Ночной колпак" in hat:
+            blue = 0xFF5C6BC0
+            px(left + 2, top - 3, right - 1, top, blue)
+            px(right - 1, top - 2, right + 1, top - 1, 0xFFFFFFFF)
+        elif "Кошачьи ушки" in hat:
+            px(left + 1, top - 2, left + 3, top, body_color)
+            px(right - 3, top - 2, right - 1, top, body_color)
+            px(left + 2, top - 1, left + 3, top, 0xFFFF80AB)
+            px(right - 2, top - 1, right - 1, top, 0xFFFF80AB)
+        elif "Цилиндр" in hat:
+            px(left, top - 1, right, top, 0xFF1A1A1A)
+            px(left + 3, top - 4, right - 3, top - 1, 0xFF2A2A2A)
+            px(right - 3, ey, right - 1, ey + 2, 0xFFFFD700)
+        elif "Каска" in hat:
+            px(left - 1, top - 1, right + 1, top, 0xFFFFB300)
+            px(left + 2, top - 3, right - 2, top - 1, 0xFFFFC107)
+        elif "Очки Thug" in hat:
+            px(left + 1, ey, right - 1, ey + 2, 0xFF111111)
+            px(left + 3, ey + 1, left + 4, ey + 2, 0xFFFFFFFF)
+            px(right - 4, ey + 1, right - 3, ey + 2, 0xFFFFFFFF)
+        elif "Мага" in hat:
+            px(left, top - 1, right, top, 0xFF4A148C)
+            px(left + 4, top - 4, right - 4, top - 1, 0xFF7B1FA2)
+            px((left + right) // 2, top - 5, (left + right) // 2 + 1, top - 4, 0xFFFFD700)
+
+        return bmp
+
+    def _particle_bitmap(self, kind, is_gold=False):
+        cache_key = f"{kind}_gold" if is_gold else kind
+        bmp = self._particle_bitmaps.get(cache_key)
+        if bmp is not None:
+            return bmp
+        rows = PATTERNS[kind]
+        if kind == "poop":
+            colors = GOLD_POOP_COLORS if is_gold else POOP_COLORS
+            s = max(2, int(self._unit * 0.9))
+        else:
+            colors = {"X": {"heart": HEART_COLOR, "zzz": ZZZ_COLOR, "spark": SPARK_COLOR, "note": NOTE_COLOR}[kind]}
+            s = max(2, int(self._unit * 0.75))
+
+        bmp = Bitmap.createBitmap(len(rows[0]) * s, len(rows) * s, Bitmap.Config.ARGB_8888)
+        canvas = Canvas(bmp)
+        paints = {ch: Paint() for ch in colors}
+        for ch, color in colors.items():
+            paints[ch].setColor(jint(as_java_color(color)))
+        for y, row in enumerate(rows):
+            for x, ch in enumerate(row):
+                p = paints.get(ch)
+                if p is not None:
+                    canvas.drawRect(float(x * s), float(y * s), float((x + 1) * s), float((y + 1) * s), p)
+        self._particle_bitmaps[cache_key] = bmp
+        return bmp
+
+    def _reset_state(self):
+        now = time.monotonic()
+        self._state = "idle"
+        self._x = 0.0
+        self._y = 0.0
+        self._vx = 0.0
+        self._vy = 0.0
+        self._pos_ready = False
+        self._last_tick = now
+        self._last_interaction = now
+        self._next_action = now + 4.0
+        self._next_blink = now + 2.0
+        self._blink_until = 0.0
+        self._look = 0
+        self._expr = None
+        self._expr_until = 0.0
+        self._squash_until = 0.0
+        self._wave_until = 0.0
+        self._hop_active = False
+        self._hop_off = 0.0
+        self._hop_vy = 0.0
+        self._walk_target = 0.0
+        self._touch = None
+        self._last_tap = 0.0
+        self._recent_taps = []
+        self._next_heart = 0.0
+        self._next_z = 0.0
+        self._bubble_visible = False
+        self._bubble_fade_in = False
+        self._bubble_until = 0.0
+        self._bubble_gen = 0
+        self._last_phrase = None
+        self._bounds_cache = None
+        self._bounds_time = 0.0
+        self._attach_check = 0.0
+        self._greet_pending = False
+        self._next_eat = now + 20.0
+        self._mouth_open_until = 0.0
+        self._chew_until = 0.0
+        self._media = None
+        self._media_check = 0.0
+        self._next_note = 0.0
+        self._next_msg_react = 0.0
+        self._next_sent_react = 0.0
+        self._chat_dialog = 0
+        self._next_chat_comment = now + 8.0
+        self._rotation = 0
+        self._accel_prev = None
+        self._shake_hits = []
+        self._shake_pending = None
+        self._shake_dizzy = False
+        self._tilt = 0.0
+        self._slide_v = 0.0
+        self._next_slide_say = 0.0
+        self._platform = None
+        self._platforms = []
+        self._platform_scan = 0.0
+        self._platform_moving = False
+        self._walk_in = False
+        self._hang_start = 0.0
+        self._hang_until = 0.0
+        self._peek_side = 0
+        self._peek_pending = 0
+        self._peek_phase = "hide"
+        self._peek_phase_until = 0.0
+        self._peek_end = 0.0
+        self._peek_moving = False
+        self._poop_due = 0.0
+        self._poop_need = random.randint(*POOP_EVERY)
+        self._platform_span = None
+        self._next_peek = now + PEEK_AFTER
+        self._is_singing = False
+        self._current_lyric_idx = -1
+        self._track_base_pos = 0.0
+        self._track_base_time = 0.0
+        self._track_is_playing = False
+        self._user_offset = 0.0
+        self._position_known = True
+
+        self._battery_level = 100
+        self._is_charging = False
+        self._last_battery_check = 0.0
+        self._nightstand_mode = False
+        self._laser_active = False
+
+    def _schedule(self, delay):
+        if self._handler is None or self._tick_r is None:
+            return
+        self._handler.removeCallbacks(self._tick_r)
+        self._handler.postDelayed(self._tick_r, int(delay))
+
+    def _tick(self):
+        if not self._running or self._paused:
+            return
+        t0 = time.monotonic()
+        try:
+            self._step()
+        except Exception as e:
+            CLOG.log_error("TICK", "Tick loop error", e)
+        dt_tick = (time.monotonic() - t0) * 1000.0
+        self._tick_times.append(dt_tick)
+
+        if self._running and not self._paused:
+            self._schedule(self._next_delay())
+
+    def _next_delay(self):
+        if self._pet is None:
+            return 1000
+        now = time.monotonic()
+
+        # 4.2 Адаптивный цикл анимаций:
+        # 16 мс (60 fps) активируется строго при наличии активных динамических состояний:
+        is_dynamic = (
+            self._state in ("press", "drag", "pet", "fly", "walk")
+            or self._hop_active
+            or self._bubble_fade_in
+            or self._walk_in
+            or self._laser_active
+            or self._platform_moving
+            or abs(self._slide_v) > 0.0
+            or self._shake_pending is not None
+            or now < self._squash_until
+            or (self._expr == "dizzy" and now < self._expr_until)
+        )
+
+        if is_dynamic:
+            # При режиме энергосбережения 60 fps ограничиваются до 30 fps (33 мс)
+            if self._power_save_mode:
+                return 33
+            return 16
+
+        # Во время воспроизведения музыки: если питомец в idle — танец не реже 33 мс (30 fps)
+        if self._media == "music" and self._state == "idle":
+            return 33
+
+        if self._state in ("hang", "peek"):
+            return 33
+
+        # В режиме сна (sleep): задержка 250 мс
+        if self._state == "sleep":
+            return 250
+
+        # В состоянии покоя без музыки (idle): частота тика снижается до 8–10 тиков/с (100–125 мс)
+        return 110
+
+    def _dp(self, value):
+        return float(AndroidUtilities.dp(value))
+
+    def _bounds(self, now):
+        if self._bounds_cache is not None and now - self._bounds_time < 0.4:
+            return self._bounds_cache
+        decor = self._decor
+        width = decor.getWidth()
+        height = decor.getHeight()
+        top_inset = AndroidUtilities.statusBarHeight
+        bottom_inset = AndroidUtilities.navigationBarHeight
+        try:
+            insets = decor.getRootWindowInsets()
+            if insets is not None:
+                top_inset = insets.getSystemWindowInsetTop()
+                bottom_inset = insets.getSystemWindowInsetBottom()
+        except Exception:
+            pass
+        try:
+            display = decor.getDisplay()
+            if display is not None:
+                self._rotation = int(display.getRotation())
+        except Exception:
+            pass
+        self._bounds_cache = (
+            0.0,
+            float(max(0, width - self._w)),
+            float(top_inset),
+            float(max(top_inset, height - bottom_inset - self._h)),
+            width,
+            height,
+        )
+        self._bounds_time = now
+        return self._bounds_cache
+
+    def _step(self):
+        now = time.monotonic()
+        dt = clamp(now - self._last_tick, 0.0, 0.05)
+        self._last_tick = now
+
+        if now >= self._attach_check:
+            self._attach_check = now + 1.0
+            self._ensure_attached()
+            self._prune_eaten()
+            if self._pet is not None and self._pos_ready:
+                self._poll_chat(now)
+                self._check_battery(now)
+                self._check_telemetry_summary(now)
+
+        if self._pet is None or self._decor is None:
+            return
+        if self._pos_ready:
+            self._poll_media(now)
+            self._poll_clipboard(now)
+        if self._decor.getWidth() <= 0:
+            return
+
+        min_x, max_x, min_y, max_y, width, height = self._bounds(now)
+        if not self._pos_ready:
+            self._restore_position(min_x, max_x, min_y, max_y)
+            self._pos_ready = True
+            if self._greet_pending:
+                self._greet_pending = False
+                self._hop(self._dp(420))
+                self._say("hello")
+
+        if self._is_charging and (self._rotation in (Surface.ROTATION_90, Surface.ROTATION_270)):
+            if not self._nightstand_mode:
+                self._nightstand_mode = True
+                self._x = max_x - self._dp(30)
+                self._y = min_y + self._dp(10)
+                self._state = "sleep"
+                self._set_expr("sleep", 9999.0)
+        else:
+            self._nightstand_mode = False
+
+        gravity = bool(self._cfg.get("gravity", False))
+        state = self._state
+
+        if state == "press" and self._touch is not None and now - self._touch["t0"] >= 0.4:
+            self._start_pet(now)
+            state = self._state
+
+        if self._shake_pending is not None and state not in ("press", "drag", "pet"):
+            ax, ay = self._shake_pending
+            self._shake_pending = None
+            self._apply_shake_vector(ax, ay)
+            state = self._state
+
+        if state == "pet":
+            if now >= self._next_heart:
+                self._next_heart = now + 0.45
+                self._spawn_particle("heart")
+                self._haptic(4)
+        elif state == "fly":
+            self._step_fly(dt, now, gravity, min_x, max_x, min_y, max_y)
+        elif state == "hang":
+            self._step_hang(now, gravity, min_x, max_x, min_y)
+        elif state == "peek":
+            self._step_peek(dt, now, width)
+        elif state in ("idle", "walk", "sleep"):
+            self._step_ground(dt, now, gravity, min_x, max_x, min_y, max_y)
+
+        if self._hop_active:
+            self._hop_off += self._hop_vy * dt
+            self._hop_vy += self._dp(2600) * dt
+            if self._hop_off >= 0.0:
+                self._hop_off = 0.0
+                self._hop_vy = 0.0
+                self._hop_active = False
+                self._squash_until = now + 0.1
+
+        self._render(now)
+        self._update_bubble(now, width, min_y)
+
+    def _check_battery(self, now):
+        if not self._cfg.get("battery_react", True) or now < self._last_battery_check:
+            return
+        self._last_battery_check = now + 15.0
+        try:
+            ctx = self._pet.getContext() if self._pet else LaunchActivity.instance
+            if not ctx:
+                return
+            bm = ctx.getSystemService(Context.BATTERY_SERVICE)
+            if bm:
+                level = int(bm.getIntProperty(4))
+                charging = bool(getattr(bm, "isCharging", lambda: False)())
+                was_charging = self._is_charging
+                self._battery_level = level
+                self._is_charging = charging
+
+                if charging and not was_charging:
+                    self._say("charging", force=True)
+                    self._hop(self._dp(450))
+                    for _ in range(4):
+                        self._spawn_particle("spark")
+                elif not charging and level < 15 and random.random() < 0.2:
+                    self._say("battery_low")
+
+            # Проверка PowerManager.isPowerSaveMode()
+            pm = ctx.getSystemService(Context.POWER_SERVICE)
+            if pm:
+                self._power_save_mode = bool(getattr(pm, "isPowerSaveMode", lambda: False)())
+        except Exception:
+            pass
+
+    def _check_telemetry_summary(self, now: float):
+        if now - self._last_summary_time < 60.0:
+            return
+        self._last_summary_time = now
+        fps = 0.0
+        avg_tick = 0.0
+        max_tick = 0.0
+        if self._tick_times:
+            avg_tick = sum(self._tick_times) / len(self._tick_times)
+            max_tick = max(self._tick_times)
+            fps = 1000.0 / max(1.0, avg_tick)
+
+        avg_scan = 0.0
+        if self._platform_scan_times:
+            avg_scan = sum(self._platform_scan_times) / len(self._platform_scan_times)
+
+        CLOG.log_info(
+            "TELEMETRY",
+            f"Сводка производительности (60с): FPS={fps:.1f}, тик avg={avg_tick:.1f}мс, max={max_tick:.1f}мс, мост ping={self._bridge_last_ping_latency:.1f}мс, скан платформ={avg_scan:.1f}мс",
+            fps=f"{fps:.1f}",
+            avg_tick_ms=f"{avg_tick:.1f}",
+            max_tick_ms=f"{max_tick:.1f}",
+            bridge_latency_ms=f"{self._bridge_last_ping_latency:.1f}",
+            scan_platforms_ms=f"{avg_scan:.1f}",
+        )
+
+    def _poll_clipboard(self, now):
+        if not self._cfg.get("clipboard_sync", False) or now < self._clip_check_time:
+            return
+        self._clip_check_time = now + 2.5
+        ctx = self._pet.getContext() if self._pet else LaunchActivity.instance
+        if not ctx:
+            return
+        try:
+            cm = ctx.getSystemService(Context.CLIPBOARD_SERVICE)
+            if not cm or not cm.hasPrimaryClip():
+                return
+            clip = cm.getPrimaryClip()
+            if not clip or clip.getItemCount() <= 0:
+                return
+            clip_text = str(clip.getItemAt(0).getText() or "").strip()
+            if not clip_text or clip_text == self._last_checked_clip:
+                return
+            self._last_checked_clip = clip_text
+
+            # Приватность: текст буфера не логируем! Реагирует ТОЛЬКО на валидные ссылки SoundCloud
+            if "soundcloud.com/" in clip_text:
+                CLOG.log_info("CLIPBOARD", "Обнаружена SoundCloud ссылка в буфере обмена")
+
+                def _on_resolved(res):
+                    if res:
+                        a, t = res
+                        run_on_ui_thread(lambda: self._start_custom_song(f"{a} - {t}"))
+
+                threading.Thread(
+                    target=lambda: _on_resolved(self._lyrics_helper.resolve_soundcloud_url(clip_text)),
+                    daemon=True,
+                ).start()
+        except Exception:
+            pass
+
+    def _fat_stage(self):
+        c = len(self._eaten)
+        if c <= 1: return 0
+        if c <= 3: return 1
+        if c <= 6: return 2
+        return 3
+
+    def _step_ground(self, dt, now, gravity, min_x, max_x, min_y, max_y):
+        self._walk_in = False
+        fat = self._fat_stage()
+        speed_factor = [1.0, 0.85, 0.65, 0.45][fat]
+
+        if self._state != "walk":
+            if self._x < min_x - 0.5 or self._x > max_x + 0.5:
+                step = self._dp(60) * dt * speed_factor
+                if self._x < min_x:
+                    self._x = min(min_x, self._x + step)
+                    self._look = 1
+                else:
+                    self._x = max(max_x, self._x - step)
+                    self._look = -1
+                self._walk_in = True
+            else:
+                self._x = clamp(self._x, min_x, max_x)
+
+        self._platform_moving = False
+        if gravity:
+            if self._platform is not None:
+                if not self._follow_platform(min_y, max_y):
+                    self._fall(self._dp(42) * self._look if self._state == "walk" else 0.0)
+                    return
+            elif self._y < max_y - 0.5 and not self._hop_active:
+                self._fall(0.0)
+                return
+            else:
+                self._y = min(self._y, max_y)
+                if random.random() < 0.02 and not self._hop_active and self._platforms:
+                    self._hop(self._dp(500))
+            if self._step_slide(dt, now, min_x, max_x):
+                return
+        else:
+            self._y = clamp(self._y, min_y, max_y)
+            self._slide_v = 0.0
+
+        if self._state == "walk":
+            direction = 1 if self._walk_target > self._x else -1
+            self._look = direction
+            self._x += direction * self._dp(42) * dt * speed_factor
+            reached = (direction > 0 and self._x >= self._walk_target) or (direction < 0 and self._x <= self._walk_target)
+            hit_edge = (direction < 0 and self._x <= min_x) or (direction > 0 and self._x >= max_x)
+            if reached or hit_edge:
+                self._x = clamp(self._x, min_x, max_x)
+                self._state = "idle"
+                self._next_action = now + random.uniform(2.5, 6.0)
+                side = self._peek_pending
+                self._peek_pending = 0
+                edge = self._dp(4)
+                if side and ((side < 0 and self._x <= min_x + edge) or (side > 0 and self._x >= max_x - edge)):
+                    self._start_peek(now, side)
+                    return
+                self._save_position()
+            return
+
+        if self._state == "sleep":
+            if now >= self._next_z:
+                self._next_z = now + 1.6
+                self._spawn_particle("zzz")
+            return
+
+        if now >= self._next_blink:
+            self._blink_until = now + 0.13
+            self._next_blink = now + (0.35 if random.random() < 0.15 else random.uniform(2.0, 5.5))
+
+        sleep_idx = clamp(int(self._cfg.get("sleep", 1)), 0, len(SLEEP_SECONDS) - 1)
+        timeout = SLEEP_SECONDS[sleep_idx]
+        if (
+            timeout
+            and now - self._last_interaction > timeout
+            and not self._hop_active
+            and not self._media
+            and not self._walk_in
+        ):
+            self._state = "sleep"
+            self._look = 0
+            self._next_z = now + 0.6
+            self._hide_bubble()
+            # Отменяем караоке таймер при переходе в сон
+            if self._handler and self._karaoke_switch_r:
+                self._handler.removeCallbacks(self._karaoke_switch_r)
+            return
+
+        if self._poop_due and now >= self._poop_due and not self._hop_active and not self._walk_in:
+            self._do_poop(now, min_x, max_x)
+            return
+
+        if self._media:
+            if now >= self._next_note:
+                self._next_note = now + (0.75 if self._media == "music" else 1.4)
+                self._spawn_particle("note")
+            return
+
+        if now < self._next_action or self._hop_active or self._walk_in or self._is_singing or self._laser_active:
+            return
+        self._next_action = now + random.uniform(3.5, 9.0)
+
+        if (
+            self._cfg.get("eat", True)
+            and now >= self._next_eat
+            and len(self._eaten) < MAX_EATEN
+            and random.random() < 0.35
+        ):
+            if self._try_eat(now, min_y):
+                return
+            self._next_eat = now + 8.0
+
+        roll = random.random()
+        if not self._cfg.get("wander", True):
+            if roll < 0.5:
+                self._look = random.choice((-1, 0, 1))
+            return
+
+        if (
+            self._platform is None
+            and now >= self._next_peek
+            and now - self._last_interaction > PEEK_AFTER
+            and roll < 0.3
+        ):
+            side = -1 if self._x - min_x < max_x - self._x else 1
+            self._walk_target = min_x if side < 0 else max_x
+            self._peek_pending = side
+            self._state = "walk"
+            return
+
+        if roll < 0.38:
+            distance = random.uniform(self._dp(40), self._dp(150)) * random.choice((-1, 1))
+            lo, hi = min_x, max_x
+            if self._platform is not None and self._platform_span is not None:
+                x0, x1 = self._platform_span
+                lo = max(lo, x0 - self._unit * 4)
+                hi = min(hi, x1 - self._unit * 14)
+            target = clamp(self._x + distance, lo, hi)
+            if abs(target - self._x) > self._dp(12):
+                self._walk_target = target
+                self._state = "walk"
+        elif roll < 0.58:
+            self._look = random.choice((-1, 0, 1))
+        elif roll < 0.72:
+            self._say("idle")
+        elif roll < 0.84:
+            self._hop(self._dp(360))
+        else:
+            self._wave_until = now + 1.6
+
+    def _fall(self, vx):
+        self._state = "fly"
+        self._platform = None
+        self._platforms = []
+        self._platform_scan = 0.0
+        self._vx = vx + self._slide_v
+        self._vy = 0.0
+        self._slide_v = 0.0
+
+    def _tilt_accel(self):
+        tilt = self._tilt if self._sensor_listener is not None else 0.0
+        if abs(tilt) <= TILT_DEAD:
+            return 0.0
+        return (tilt - math.copysign(TILT_DEAD, tilt)) * self._dp(2200)
+
+    def _step_slide(self, dt, now, min_x, max_x):
+        if not self._hop_active:
+            self._slide_v += self._tilt_accel() * dt
+        self._slide_v *= math.exp(-2.5 * dt)
+        if abs(self._slide_v) < self._dp(6):
+            self._slide_v = 0.0
+            return False
+        self._x += self._slide_v * dt
+        if self._x < min_x or self._x > max_x:
+            self._x = clamp(self._x, min_x, max_x)
+            if abs(self._slide_v) > self._dp(150):
+                self._squash_until = now + 0.12
+                self._haptic(3)
+            self._slide_v = 0.0
+            return False
+        if abs(self._slide_v) < self._dp(60):
+            return False
+        self._state = "idle"
+        self._peek_pending = 0
+        self._look = 1 if self._slide_v > 0 else -1
+        if now >= self._next_slide_say:
+            self._next_slide_say = now + 8.0
+            if random.random() < 0.5:
+                self._say("slide")
+        return True
+
+    def _feet_on(self, x0, x1):
+        feet0 = self._x + self._unit * 4
+        feet1 = self._x + self._unit * 14
+        return min(feet1, x1) - max(feet0, x0) >= self._unit * 2
+
+    def _platform_rect(self, view, kind, dloc=None):
+        try:
+            if view is None or not view.isAttachedToWindow() or view.getVisibility() != View.VISIBLE:
+                return None
+            if dloc is None:
+                dloc = jarray(jint)([0, 0])
+                self._decor.getLocationInWindow(dloc)
+            loc = jarray(jint)([0, 0])
+            view.getLocationInWindow(loc)
+            x = float(loc[0] - dloc[0])
+            y = float(loc[1] - dloc[1])
+            if kind == "msg":
+                left = view.getBackgroundDrawableLeft()
+                right = view.getBackgroundDrawableRight()
+                top = view.getBackgroundDrawableTop()
+                if right - left < self._dp(40):
+                    return None
+                return (x + left, x + right, y + top)
+            return (x, x + view.getWidth(), y)
+        except Exception:
+            return None
+
+    def _scan_platforms(self, min_y, max_y):
+        now = time.monotonic()
+        # 4.4 Кэширование: обход дерева не чаще раза в 350-400 мс
+        if self._platforms_cache and (now - self._last_platforms_scan_time < 0.38):
+            return self._platforms_cache
+
+        t_scan_start = time.monotonic()
+        result = []
+        try:
+            dloc = jarray(jint)([0, 0])
+            self._decor.getLocationInWindow(dloc)
+            views = []
+
+            fragment = get_last_fragment()
+            if fragment is not None and isinstance(fragment, ChatActivity):
+                enter = fragment.getChatActivityEnterView()
+                if enter is not None:
+                    views.append((enter, "input"))
+                listing = fragment.getChatListView()
+                if listing is not None and ChatMessageCell is not None:
+                    for i in range(listing.getChildCount()):
+                        child = listing.getChildAt(i)
+                        if child is not None and isinstance(child, ChatMessageCell):
+                            views.append((child, "msg"))
+            else:
+                stack = [self._decor]
+                visited = 0
+                while stack and visited < 400:
+                    v = stack.pop()
+                    visited += 1
+                    if v is None or v.getVisibility() != View.VISIBLE:
+                        continue
+                    if isinstance(v, RecyclerView):
+                        for i in range(v.getChildCount()):
+                            ch = v.getChildAt(i)
+                            if ch is not None and ch.getHeight() > self._dp(24):
+                                views.append((ch, "card"))
+                        break
+                    count = v.getChildCount() if isinstance(v, ViewGroup) else 0
+                    for i in range(count):
+                        child = v.getChildAt(i)
+                        if child is not None:
+                            stack.append(child)
+
+            lowest = min_y - self._unit * 2 + self._h
+            highest = max_y + self._h
+            for view, kind in views:
+                rect = self._platform_rect(view, kind, dloc)
+                if rect is None:
+                    continue
+                x0, x1, top = rect
+                if x1 - x0 >= self._w * 0.6 and lowest <= top <= highest:
+                    result.append((view, kind, x0, x1, top))
+        except Exception as e:
+            CLOG.log_error("PLATFORM", "Scan error", e)
+
+        scan_dur = (time.monotonic() - t_scan_start) * 1000.0
+        self._platform_scan_times.append(scan_dur)
+        self._platforms_cache = result
+        self._last_platforms_scan_time = now
+        return result
+
+    def _follow_platform(self, min_y, max_y):
+        view, kind = self._platform
+        rect = self._platform_rect(view, kind)
+        if rect is None:
+            return False
+        x0, x1, top = rect
+        if not self._feet_on(x0, x1):
+            return False
+        y = top - self._h
+        if y < min_y - self._unit * 2 or y > max_y:
+            return False
+        self._platform_moving = abs(y - self._y) > 0.5
+        self._platform_span = (x0, x1)
+        self._y = y
+        return True
+
+    def _platform_landing(self, now, old_y, min_y, max_y):
+        if now >= self._platform_scan:
+            self._platform_scan = now + 0.25
+            self._platforms = self._scan_platforms(min_y, max_y)
+        prev_bottom = old_y + self._h
+        new_bottom = self._y + self._h
+        best = None
+        for item in self._platforms:
+            top = item[4]
+            if prev_bottom <= top + 1 and new_bottom >= top and self._feet_on(item[2], item[3]):
+                if best is None or top < best[4]:
+                    best = item
+        if best is None:
+            return None
+        view, kind, x0, x1, top = best
+        speed = self._vy
+        self._y = top - self._h
+        if speed > self._dp(380):
+            self._vy = -speed * 0.42
+            self._vx *= 0.75
+            self._squash_until = now + 0.1
+        else:
+            self._platform_span = (x0, x1)
+            self._land(now, (view, kind))
+        return speed
+
+    def _step_fly(self, dt, now, gravity, min_x, max_x, min_y, max_y):
+        old_y = self._y
+        self._x += self._vx * dt
+        self._y += self._vy * dt
+        if gravity:
+            self._vy += self._dp(2600) * dt
+            self._vx *= math.exp(-0.35 * dt)
+            self._vx += self._tilt_accel() * dt
+        else:
+            friction = math.exp(-2.0 * dt)
+            self._vx *= friction
+            self._vy *= friction
+
+        impact = 0.0
+        if self._x < min_x:
+            self._x = min_x
+            impact = max(impact, abs(self._vx))
+            self._vx = abs(self._vx) * 0.55
+        elif self._x > max_x:
+            self._x = max_x
+            impact = max(impact, abs(self._vx))
+            self._vx = -abs(self._vx) * 0.55
+
+        landed = None
+        if gravity and self._vy > 0 and self._y > old_y:
+            landed = self._platform_landing(now, old_y, min_y, max_y)
+        if landed is not None:
+            impact = max(impact, landed)
+        elif self._y < min_y:
+            if self._vy < -self._dp(250) and not self._shake_dizzy:
+                self._start_hang(now, min_y)
+                return
+            self._y = min_y
+            impact = max(impact, abs(self._vy))
+            self._vy = abs(self._vy) * 0.55
+        elif self._y > max_y:
+            self._y = max_y
+            impact = max(impact, abs(self._vy))
+            if gravity and self._vy < self._dp(380):
+                self._land(now)
+            else:
+                self._vy = -abs(self._vy) * (0.42 if gravity else 0.55)
+                self._vx *= 0.75 if gravity else 1.0
+                self._squash_until = now + 0.1
+
+        if impact > self._dp(2300):
+            self._set_expr("dizzy", 2.6)
+            self._say("dizzy")
+            self._haptic(1)
+        elif impact > self._dp(900):
+            self._haptic(3)
+
+        if self._state == "fly" and not gravity and math.hypot(self._vx, self._vy) < self._dp(45):
+            self._land(now)
+
+    def _land(self, now, platform=None):
+        self._state = "idle"
+        self._vx = 0.0
+        self._vy = 0.0
+        self._platform = platform
+        self._platforms = []
+        self._squash_until = now + 0.14
+        self._next_action = now + random.uniform(2.0, 5.0)
+        if self._fat_stage() == 3:
+            self._haptic(1)
+        if self._shake_dizzy:
+            self._shake_dizzy = False
+            self._set_expr("dizzy", 3.0)
+            self._say("dizzy")
+        self._save_position()
+
+    def _on_accel(self, ax, ay, az):
+        if not self._running or self._paused or self._pet is None:
+            return
+        now = time.monotonic()
+        prev = self._accel_prev
+        self._accel_prev = (ax, ay, az)
+        if prev is not None:
+            jerk = math.sqrt((ax - prev[0]) ** 2 + (ay - prev[1]) ** 2 + (az - prev[2]) ** 2)
+            if self._state in ("press", "drag", "pet") and jerk > 16.0:
+                self._shake_hits = []
+                self._trigger_magic_8ball(now)
+                return
+
+            if jerk > SHAKE_JERK and self._state not in ("press", "drag", "pet"):
+                hits = [t for t in self._shake_hits if now - t < SHAKE_WINDOW]
+                hits.append(now)
+                if len(hits) >= SHAKE_HITS:
+                    hits = []
+                    self._shake_pending = (ax - prev[0], ay - prev[1])
+                    self._schedule(0)
+                self._shake_hits = hits
+
+        rotation = self._rotation
+        if rotation == Surface.ROTATION_90:
+            sx, sy = ay, ax
+        elif rotation == Surface.ROTATION_180:
+            sx, sy = ax, -ay
+        elif rotation == Surface.ROTATION_270:
+            sx, sy = -ay, -ax
+        else:
+            sx, sy = -ax, ay
+        raw = clamp(sx / EARTH_G, -1.0, 1.0) if sy > 2.0 else 0.0
+        self._tilt = self._tilt * 0.7 + raw * 0.3
+
+    def _trigger_magic_8ball(self, now):
+        self._state = "idle"
+        self._touch = None
+        self._set_expr("dizzy", 2.5)
+        fortune = random.choice(FORTUNES)
+        self._say(f"🎱 {fortune}", force=True)
+        self._haptic(1)
+        for _ in range(4):
+            self._spawn_particle("spark")
+
+    def _apply_shake_vector(self, d_ax: float, d_ay: float):
+        self._state = "fly"
+        speed = math.hypot(d_ax, d_ay)
+        norm = max(1.0, speed)
+        power = min(self._dp(1200 + speed * 60.0), self._dp(3400))
+        self._vx = (-d_ax / norm) * power
+        self._vy = (d_ay / norm) * power
+        self._shake_dizzy = True
+        self._set_expr("surprised", 1.0)
+        self._haptic(1)
+        self._say("shake")
+
+    def _start_hang(self, now, min_y):
+        self._state = "hang"
+        self._vx = 0.0
+        self._vy = 0.0
+        self._y = min_y - self._unit * 2
+        self._hang_start = now
+        self._hang_until = now + random.uniform(2.0, 3.5)
+        self._haptic(3)
+        self._say("hang")
+
+    def _step_hang(self, now, gravity, min_x, max_x, min_y):
+        self._x = clamp(self._x, min_x, max_x)
+        self._y = min_y - self._unit * 2
+        if now < self._hang_until:
+            return
+        self._state = "fly"
+        self._vx = 0.0
+        self._vy = self._dp(150) if gravity else self._dp(700)
+        self._set_expr("surprised", 0.8)
+        self._haptic(3)
+        self._say("hang_fall")
+
+    def _start_peek(self, now, side):
+        self._state = "peek"
+        self._peek_side = side
+        self._peek_phase = "hide"
+        self._peek_phase_until = now + random.uniform(3.0, 6.0)
+        self._peek_end = now + random.uniform(30.0, 60.0)
+        self._look = side
+
+    def _step_peek(self, dt, now, width):
+        phase = self._peek_phase
+        units = PEEK_OUT_UNITS if phase == "out" else PEEK_HIDDEN_UNITS
+        target = float(width - units * self._unit) if self._peek_side > 0 else float(units * self._unit - self._w)
+        step = self._dp(50) * dt
+        self._peek_moving = abs(target - self._x) > 0.5
+        if self._peek_moving:
+            self._x = min(target, self._x + step) if target > self._x else max(target, self._x - step)
+        self._look = self._peek_side if (phase == "hide" and self._peek_moving) else -self._peek_side
+        if now >= self._next_blink:
+            self._blink_until = now + 0.13
+            self._next_blink = now + random.uniform(2.0, 5.5)
+        if now < self._peek_phase_until or self._peek_moving:
+            return
+        if now >= self._peek_end:
+            self._end_peek(now)
+            return
+        if phase == "hide":
+            self._peek_phase = "out"
+            self._peek_phase_until = now + random.uniform(1.5, 2.8)
+            self._say("peek")
+        else:
+            self._peek_phase = "hide"
+            self._peek_phase_until = now + random.uniform(3.0, 7.0)
+
+    def _end_peek(self, now):
+        side = self._peek_side
+        self._peek_side = 0
+        self._peek_moving = False
+        self._next_peek = now + random.uniform(60.0, 120.0)
+        self._state = "idle"
+        if self._bounds_cache is None or not side:
+            return
+        min_x, max_x = self._bounds_cache[:2]
+        inside = min_x + self._dp(30) if side < 0 else max_x - self._dp(30)
+        self._walk_target = clamp(inside, min_x, max_x)
+        self._state = "walk"
+        self._next_action = now + random.uniform(3.0, 6.0)
+
+    def _compose(self, now):
+        eyes = "open"
+        look = self._look
+        arms = "normal"
+        legs = "stand"
+        squash = 0
+        blush = False
+        mouth = None
+        state = self._state
+        fat = self._fat_stage()
+
+        if state in ("drag", "fly"):
+            eyes, arms, legs = "surprised", "up", "dangle"
+        elif state == "pet":
+            eyes, blush = "happy", True
+            squash = 1 if int(now * 3) % 2 else 0
+            look = 0
+        elif state == "sleep":
+            eyes, arms, legs, look = "sleep", "tuck", "tuck", 0
+        elif state == "walk":
+            legs = "walk1" if int(now * 7) % 2 else "walk2"
+        elif state == "press":
+            squash = 1
+        elif state == "hang":
+            eyes = "surprised" if now - self._hang_start < 0.5 else "open"
+            arms, legs = "up", "dangle"
+
+        if state in ("idle", "walk") and now < self._wave_until:
+            arms = "wave1" if int(now * 6) % 2 else "wave2"
+
+        if state == "idle" and self._media and not self._hop_active:
+            beat = int(now * 4) % 2
+            eyes = "happy"
+            arms = "wave1" if beat else "wave2"
+            legs = "walk1" if beat else "walk2"
+            squash = 1 if beat else 0
+
+        if now < self._expr_until and self._expr and state != "sleep":
+            eyes = self._expr
+            if self._expr == "happy":
+                blush = True
+        if now < self._squash_until and squash == 0:
+            squash = 1
+        if eyes == "open" and state in ("idle", "walk", "peek", "hang") and now < self._blink_until:
+            eyes = "blink"
+
+        if state != "sleep":
+            if self._is_singing:
+                mouth = "open" if int(now * 7) % 2 else "chew"
+            elif now < self._mouth_open_until:
+                mouth = "open"
+            elif now < self._chew_until and int(now * 6) % 2:
+                mouth = "chew"
+
+        hat_idx = clamp(int(self._cfg.get("hat", 0)), 0, len(HATS) - 1)
+        hat = HATS[hat_idx]
+
+        # Цветовая фаза (для Dirty Flag)
+        color_idx = clamp(int(self._cfg.get("color", 0)), 0, len(PALETTES) - 1)
+        color_sig = color_idx
+        if color_idx == 9:
+            color_sig = int((now * 0.4 % 1.0) * 30)  # 30 фаз радуги
+        elif color_idx == 10:
+            color_sig = Theme.getColor(Theme.key_actionBarDefault)
+
+        return (eyes, look, arms, legs, squash, blush, mouth, hat, fat, color_sig)
+
+    def _render(self, now):
+        key = self._compose(now)
+
+        # 4.3 Dirty Flag (Флаг неизменности кадра)
+        # setImageBitmap() и setTranslation*() блокируются, если с прошлого тика не изменились координаты и кадр!
+        cur_x = float(self._x)
+        cur_y = float(self._y + self._hop_off)
+
+        rotation = 0.0
+        if self._state == "fly":
+            rotation = clamp(self._vx / self._dp(70), -25.0, 25.0)
+        elif self._state == "hang":
+            rotation = math.sin((now - self._hang_start) * 3.0) * 6.0
+        elif self._is_singing:
+            rotation = math.sin(now * 8.0) * 7.0
+        elif self._media and self._state == "idle" and not self._hop_active:
+            rotation = math.sin(now * math.pi * 2.0) * 6.0
+
+        if key != self._last_rendered_frame_key:
+            self._last_rendered_frame_key = key
+            self._pet.setImageBitmap(self._get_frame(key))
+
+        if self._last_rendered_x != cur_x:
+            self._last_rendered_x = cur_x
+            self._pet.setTranslationX(cur_x)
+
+        if self._last_rendered_y != cur_y:
+            self._last_rendered_y = cur_y
+            self._pet.setTranslationY(cur_y)
+
+        if self._last_rendered_rot != rotation:
+            self._last_rendered_rot = rotation
+            self._pet.setRotation(float(rotation))
+
+    def _restore_position(self, min_x, max_x, min_y, max_y):
+        fx = self.get_setting("pos_x", None)
+        fy = self.get_setting("pos_y", None)
+        try:
+            fx, fy = float(fx) / 1000.0, float(fy) / 1000.0
+        except Exception:
+            fx, fy = 0.8, 0.72
+        self._x = min_x + (max_x - min_x) * clamp(fx, 0.0, 1.0)
+        self._y = min_y + (max_y - min_y) * clamp(fy, 0.0, 1.0)
+
+    def _save_position(self):
+        if self._bounds_cache is None:
+            return
+        min_x, max_x, min_y, max_y = self._bounds_cache[:4]
+        fx = (self._x - min_x) / max(1.0, max_x - min_x)
+        fy = (self._y - min_y) / max(1.0, max_y - min_y)
+        try:
+            self.set_setting("pos_x", int(clamp(fx, 0.0, 1.0) * 1000))
+            self.set_setting("pos_y", int(clamp(fy, 0.0, 1.0) * 1000))
+        except Exception as e:
+            CLOG.log_error("POS", "Save position error", e)
+
+    def _recenter(self):
+        if not self._cfg.get("show", True):
+            self._cfg["show"] = True
+            self.set_setting("show", True)
+        self._start(greet=False)
+        if self._decor is None or self._decor.getWidth() <= 0:
+            return
+        now = time.monotonic()
+        min_x, max_x, min_y, max_y = self._bounds(now)[:4]
+        self._x = (min_x + max_x) / 2.0
+        self._y = (min_y + max_y) / 2.0
+        self._pos_ready = True
+        self._state = "idle"
+        self._vx = self._vy = 0.0
+        self._slide_v = 0.0
+        self._hop(self._dp(500))
+        for _ in range(3):
+            self._spawn_particle("spark")
+        self._say("hello")
+        self._save_position()
+
+    def _on_touch(self, event):
+        action = event.getActionMasked()
+        rx, ry = float(event.getRawX()), float(event.getRawY())
+        now = time.monotonic()
+        pointer_count = event.getPointerCount()
+
+        if pointer_count >= 2:
+            self._laser_active = True
+            try:
+                lx = float(event.getX(1))
+                ly = float(event.getY(1))
+            except Exception:
+                lx, ly = rx, ry
+            self._run_towards(lx, ly)
+            if random.random() < 0.15:
+                self._say("laser_chase")
+            return True
+        else:
+            if self._laser_active:
+                self._laser_active = False
+
+        if action == MotionEvent.ACTION_DOWN:
+            self._last_interaction = now
+            self._touch = {
+                "x0": rx, "y0": ry, "t0": now,
+                "ox": rx - self._x, "oy": ry - self._y,
+                "hist": [(now, rx, ry)],
+                "anchor": rx, "dir": 0, "vx": 0.0,
+            }
+            self._hop_active = False
+            self._vx = self._vy = self._slide_v = 0.0
+            self._state = "press"
+            self._schedule(0)
+            return True
+
+        touch = self._touch
+        if touch is None:
+            return False
+
+        if action == MotionEvent.ACTION_MOVE:
+            hist = touch["hist"]
+            hist.append((now, rx, ry))
+            while len(hist) > 2 and now - hist[0][0] > 0.1:
+                hist.pop(0)
+            if self._state == "press":
+                if math.hypot(rx - touch["x0"], ry - touch["y0"]) > self._dp(8):
+                    self._state = "drag"
+                    self._platform = None
+                    self._haptic(3)
+                    self._say("drag")
+            if self._state == "drag":
+                width = self._decor.getWidth() if self._decor is not None else 0
+                height = self._decor.getHeight() if self._decor is not None else 0
+                self._x = clamp(rx - touch["ox"], -self._w * 0.3, width - self._w * 0.7)
+                self._y = clamp(ry - touch["oy"], 0.0, height - self._h * 0.5)
+            elif self._state == "pet":
+                dx = rx - touch["anchor"]
+                if abs(dx) > self._dp(10):
+                    direction = 1 if dx > 0 else -1
+                    if touch["dir"] and direction != touch["dir"]:
+                        self._stroke()
+                    touch["dir"] = direction
+                    touch["anchor"] = rx
+            return True
+
+        if action in (MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL):
+            self._touch = None
+            self._last_interaction = now
+            state = self._state
+            if state == "drag":
+                self._release_drag(now, touch, action == MotionEvent.ACTION_CANCEL)
+            elif state == "pet":
+                self._end_pet(now)
+            elif state == "press" and action == MotionEvent.ACTION_UP:
+                self._state = "idle"
+                self._tap(now)
+            self._schedule(0)
+            return True
+        return True
+
+    def _run_towards(self, tx: float, ty: float):
+        self._look = 1 if tx > self._x else -1
+        self._walk_target = tx
+        self._state = "walk"
+        self._set_expr("surprised", 0.5)
+
+    def _release_drag(self, now, touch, cancelled):
+        vx = vy = 0.0
+        hist = touch["hist"]
+        if not cancelled and len(hist) >= 2:
+            t0, x0, y0 = hist[0]
+            t1, x1, y1 = hist[-1]
+            if t1 - t0 > 0.005 and now - t1 < 0.08:
+                vx = (x1 - x0) / (t1 - t0)
+                vy = (y1 - y0) / (t1 - t0)
+        limit = self._dp(6000)
+        vx = clamp(vx, -limit, limit)
+        vy = clamp(vy, -limit, limit)
+        speed = math.hypot(vx, vy)
+        min_y = self._bounds_cache[2] if self._bounds_cache is not None else None
+
+        if speed <= self._dp(700) and min_y is not None and self._y <= min_y + self._unit * 2:
+            self._start_hang(now, min_y)
+        elif speed > self._dp(700) or self._cfg.get("gravity", False):
+            self._state = "fly"
+            self._vx = vx
+            self._vy = vy
+            if speed > self._dp(2600):
+                self._say("throw")
+        else:
+            self._state = "idle"
+            self._save_position()
+
+    def _tap(self, now):
+        # Тап по питомцу возвращает всё съеденное на свои места!
+        if self._eaten:
+            self._spit_all(now)
+            return
+        if now - self._last_tap < 0.32:
+            self._last_tap = 0.0
+            self._hop(self._dp(720))
+            self._set_expr("happy", 1.3)
+            for _ in range(3):
+                self._spawn_particle("spark")
+            self._say("jump")
+            return
+        self._last_tap = now
+        self._recent_taps = [t for t in self._recent_taps if now - t < 2.5] + [now]
+        if len(self._recent_taps) >= 6:
+            self._recent_taps = []
+            self._set_expr("angry", 2.5)
+            self._say("annoyed", force=True)
+            self._haptic(1)
+            return
+        self._squash_until = now + 0.12
+        self._set_expr("surprised", 0.45)
+        self._hop(self._dp(330))
+        self._haptic(3)
+        self._say("tap")
+
+    def _start_pet(self, now):
+        self._state = "pet"
+        self._next_heart = now + 0.1
+        self._haptic(0)
+
+    def _stroke(self):
+        self._spawn_particle("heart")
+        self._haptic(4)
+
+    def _end_pet(self, now):
+        self._state = "idle"
+        self._set_expr("happy", 2.2)
+        try:
+            count = int(self.get_setting("pets_count", 0) or 0) + 1
+            self.set_setting("pets_count", count)
+        except Exception:
+            pass
+        self._say("pet")
+
+    def _on_notification(self, id, account, args):
+        now = time.monotonic()
+        ev_read = getattr(NotificationCenter, "messagesRead", -999)
+        ev_del = getattr(NotificationCenter, "messagesDeleted", -999)
+
+        if id == ev_read:
+            if self._state in ("idle", "walk"):
+                self._hop(self._dp(380))
+                self._spawn_particle("spark")
+                self._say("read")
+            return
+
+        if id == ev_del:
+            if self._state in ("idle", "walk"):
+                self._set_expr("surprised", 2.0)
+                self._say("deleted")
+            return
+
+        if id != getattr(NotificationCenter, "didReceiveNewMessages", 1):
+            return
+        if args is None or len(args) < 2:
+            return
+
+        dialog_id = int(args[0])
+        messages = args[1]
+        texts = []
+        incoming = False
+
+        my_uid = 0
+        try:
+            my_uid = UserConfig.getInstance(account).getClientUserId()
+        except Exception:
+            pass
+
+        # 6.1 Чат «Избранное» (dialog_id == my_uid): входящие события полностью игнорируются!
+        if dialog_id == my_uid:
+            return
+
+        sender_name = None
+        for i in range(min(int(messages.size()), MAX_SCAN_MESSAGES)):
+            message = messages.get(i)
+            if message is None or message.isOut():
+                continue
+
+            from_uid = 0
+            if message.messageOwner and message.messageOwner.from_id:
+                from_uid = getattr(message.messageOwner.from_id, "user_id", 0)
+            if from_uid == my_uid:
+                continue
+
+            incoming = True
+            text = message.messageOwner.message if message.messageOwner is not None else None
+            if text:
+                t_str = str(text)
+                texts.append(t_str[:MAX_KEYWORD_TEXT].lower())
+                # Автозапуск SoundCloud из входящих сообщений (если включен)
+                if self._cfg.get("sc_autostart_incoming", False) and "soundcloud.com/" in t_str:
+                    threading.Thread(
+                        target=lambda u=t_str: self._on_soundcloud_chat_link(u),
+                        daemon=True,
+                    ).start()
+
+        if not incoming:
+            return
+
+        in_chat = dialog_id == self._chat_dialog
+        self._react_incoming(self._match_keyword(texts), in_chat, sender_name)
+
+    def _on_soundcloud_chat_link(self, raw_text: str):
+        m = re.search(r"https?://(?:on\.)?soundcloud\.com/\S+", raw_text)
+        if m:
+            res = self._lyrics_helper.resolve_soundcloud_url(m.group(0))
+            if res:
+                a, t = res
+                run_on_ui_thread(lambda: self._start_custom_song(f"{a} - {t}"))
+
+    def _match_keyword(self, texts):
+        for mood, pattern in KEYWORDS:
+            for text in texts:
+                if pattern.search(text):
+                    return mood
+        return None
+
+    def _react_incoming(self, mood, in_chat, sender_name=None):
+        now = time.monotonic()
+        if mood is None and in_chat:
+            return
+        if now < self._next_msg_react:
+            return
+        self._next_msg_react = now + (3.0 if mood else 6.0)
+
+        if mood in ("love", "compliment"):
+            self._set_expr("happy", 2.2)
+            for _ in range(3):
+                self._spawn_particle("heart")
+            self._say(mood)
+        elif mood == "laugh":
+            self._set_expr("happy", 1.6)
+            self._hop(self._dp(420))
+            self._say("laugh")
+        elif mood == "thanks":
+            self._set_expr("happy", 2.0)
+            self._hop(self._dp(380))
+            self._say("thanks")
+        elif mood == "money":
+            self._set_expr("money", 2.5)
+            self._say("money")
+        elif mood in PHRASES:
+            self._say(mood)
+        else:
+            self._set_expr("surprised", 0.7)
+            self._hop(self._dp(300))
+            self._say("mail", name=sender_name)
+        self._schedule(0)
+
+    def _on_sent(self, length, account):
+        now = time.monotonic()
+        if now < self._next_sent_react:
+            return
+        self._next_sent_react = now + 1.5
+
+        is_saved = False
+        try:
+            my_uid = UserConfig.getInstance(account).getClientUserId()
+            if self._chat_dialog == my_uid:
+                is_saved = True
+        except Exception:
+            pass
+
+        self._set_expr("happy", 1.2)
+        self._hop(self._dp(450))
+
+        if is_saved:
+            self._say("sent_self")
+        else:
+            if length > 300:
+                self._say("essay")
+            elif random.random() < 0.4:
+                self._say("sent")
+        self._schedule(0)
+
+    def _get_current_track_pos(self, now: float) -> float:
+        if not self._track_is_playing or self._track_base_time == 0.0:
+            return self._track_base_pos
+        return self._track_base_pos + max(0.0, now - self._track_base_time)
+
+    def _poll_media(self, now):
+        if now < self._media_check:
+            return
+        self._media_check = now + 0.35
+
+        kind = None
+        track_title, track_artist, player_name = None, None, "telegram"
+        track_position_ms = 0
+        duration_ms = 0
+        is_playing = False
+        position_known = True
+
+        if self._test_karaoke_active:
+            self._track_is_playing = True
+            return
+
+        # 2.1 Приоритеты источников звука:
+        # Telegram Native (строго isMusic) -> Clawd Bridge -> Ручной ввод -> Буфер обмена
+        tg_playing = False
+        if self._cfg.get("dance", True):
+            try:
+                controller = MediaController.getInstance()
+                playing = controller.getPlayingMessageObject()
+                if playing is not None and controller.isPlayingMessage(playing) and not controller.isMessagePaused():
+                    if playing.isMusic():
+                        tg_playing = True
+                        kind = "music"
+                        is_playing = True
+                        player_name = "Telegram"
+                        track_title = str(playing.getMusicTitle() or "").strip()
+                        track_artist = str(playing.getMusicAuthor() or "").strip()
+                        dur_sec = float(getattr(playing, "getDuration", lambda: 0)())
+                        duration_ms = int(dur_sec * 1000)
+                        prog = float(getattr(playing, "audioProgress", 0.0))
+                        track_position_ms = int(dur_sec * prog * 1000)
+                        position_known = True
+                    # Голосовые и кружки караоке НЕ активируют
+            except Exception as e:
+                CLOG.log_error("TG_AUDIO", "Poll error", e)
+
+            # Если плеер Telegram на паузе — источник немедленно переключается на мост
+            if not tg_playing:
+                with self._bridge_lock:
+                    b_data = self._bridge_data
+                if b_data and b_data.get("has_media") and b_data.get("is_playing"):
+                    kind = "music"
+                    is_playing = bool(b_data.get("is_playing"))
+                    player_name = str(b_data.get("player") or "Bridge")
+                    track_artist = str(b_data.get("artist") or "")
+                    track_title = str(b_data.get("title") or "")
+                    track_position_ms = int(b_data.get("position_ms") or 0)
+                    duration_ms = int(b_data.get("duration_ms") or 0)
+                    position_known = bool(b_data.get("position_known", True))
+
+        if track_title:
+            clean_a, clean_t = self._lyrics_helper.clean_metadata(track_artist, track_title)
+            # Смена трека фиксируется строго по тройке (player, artist, title)
+            triplet_id = f"{player_name}::{clean_a}::{clean_t}"
+            if triplet_id != self._current_track_id:
+                self._current_track_id = triplet_id
+                self._lyrics_timeline = []
+                self._current_lyric_idx = -1
+                self._is_singing = False
+
+                # Из памяти сессии извлекается сохранённый сдвиг _user_offset для данного трека
+                track_offset_key = f"{clean_a} - {clean_t}"
+                self._user_offset = self._session_offsets.get(track_offset_key, 0.0)
+
+                CLOG.log_info(
+                    "TRACK",
+                    f"Смена трека: '{clean_a}' — '{clean_t}' (player={player_name}, offset={self._user_offset:.3f}с)",
+                    player=player_name,
+                    artist=clean_a,
+                    title=clean_t,
+                    offset=f"{self._user_offset:.3f}",
+                )
+
+                # Треки без автора длительностью < 30 с считаются рекламой
+                is_ad = (not clean_a) and (0 < duration_ms < 30000)
+                if is_ad:
+                    CLOG.log_info("TRACK", "Обнаружена реклама: пропуск поиска слов")
+                elif self._cfg.get("karaoke", True):
+                    self._say_track_detected(clean_a, clean_t)
+
+                    def _on_lyrics_loaded(tl):
+                        def _apply():
+                            self._lyrics_timeline = tl
+                            if not tl:
+                                self._say("no_lyrics")
+                            self._reschedule_karaoke_switch()
+                        run_on_ui_thread(_apply)
+
+                    self._lyrics_helper.get_lyrics_async(clean_a, clean_t, _on_lyrics_loaded)
+
+        # 2.2 Математика синхронизации и сдвига
+        self._position_known = position_known
+        if kind == "music":
+            t_new = track_position_ms / 1000.0
+            t_calc = self._get_current_track_pos(now)
+            drift = abs(t_new - t_calc)
+
+            if not is_playing:
+                # Пауза: значение T_calc замораживается на месте
+                self._track_is_playing = False
+                self._track_base_pos = t_calc
+                self._track_base_time = now
+                if self._handler and self._karaoke_switch_r:
+                    self._handler.removeCallbacks(self._karaoke_switch_r)
+            else:
+                self._track_is_playing = True
+                # Джиттер-фильтр: перезаписываем базу только если drift > 0.25 с!
+                if drift > 0.25 or self._track_base_time == 0.0:
+                    CLOG.log_debug("JITTER", f"Дрейф базы > 0.25с ({drift*1000:.0f}мс): обновление базы", drift_ms=f"{drift*1000:.0f}")
+                    self._track_base_pos = t_new
+                    self._track_base_time = now
+                    # Перерасчет таймера караоке при коррекции базы
+                    self._reschedule_karaoke_switch()
+        else:
+            self._track_is_playing = False
+
+        if kind == self._media:
+            return
+        prev = self._media
+        self._media = kind
+        if kind is None:
+            self._is_singing = False
+            self._hide_bubble()
+            if self._handler and self._karaoke_switch_r:
+                self._handler.removeCallbacks(self._karaoke_switch_r)
+            if prev == "music" and self._state == "idle":
+                self._say("music_end")
+            return
+        if prev is None and self._state in ("idle", "walk"):
+            self._say("music" if kind == "music" else "listen")
+
+    def _say_track_detected(self, artist: str, title: str):
+        full = f"{artist} — {title}" if artist else title
+        self._say(f"🎵 {full}", force=True)
+
+    # 4.1 Декуплинг переключения строк караоке (Вариант A)
+    # Переключение отвязано от _step(), вызывается через Handler.postDelayed
+    def _reschedule_karaoke_switch(self):
+        if self._handler is None or self._karaoke_switch_r is None:
+            return
+        self._handler.removeCallbacks(self._karaoke_switch_r)
+
+        if (
+            not self._cfg.get("karaoke", True)
+            or not self._lyrics_timeline
+            or (self._media != "music" and not self._test_karaoke_active)
+            or not self._track_is_playing
+            or self._state not in ("idle", "walk")
+        ):
+            return
+
+        now = time.monotonic()
+        t_calc_raw = self._get_current_track_pos(now)
+        t_karaoke = t_calc_raw + self._user_offset
+
+        # Находим текущую строку
+        cur_idx = -1
+        next_idx = -1
+        for i, (t_sec, _) in enumerate(self._lyrics_timeline):
+            if t_sec <= t_karaoke:
+                cur_idx = i
+            else:
+                next_idx = i
+                break
+
+        delay_ms = 350
+        if next_idx >= 0:
+            t_next_line = self._lyrics_timeline[next_idx][0]
+            delta_sec = t_next_line - t_karaoke
+            delay_ms = max(30, int(delta_sec * 1000.0))  # не менее 30 мс
+        elif cur_idx >= 0:
+            delay_ms = 4000
+
+        self._handler.postDelayed(self._karaoke_switch_r, delay_ms)
+
+    def _do_karaoke_line_switch(self):
+        if not self._running or self._paused:
+            return
+        now = time.monotonic()
+        if (
+            not self._cfg.get("karaoke", True)
+            or not self._lyrics_timeline
+            or (self._media != "music" and not self._test_karaoke_active)
+            or not self._track_is_playing
+            or self._state not in ("idle", "walk")
+        ):
+            self._is_singing = False
+            return
+
+        # 2.2 Если position_known == False
+        if not self._position_known:
+            self._is_singing = False
+            self._say("sync_unavailable")
+            self._reschedule_karaoke_switch()
+            return
+
+        t_calc_raw = self._get_current_track_pos(now)
+        t_karaoke = t_calc_raw + self._user_offset
+
+        cur_idx = -1
+        for i, (t_sec, _) in enumerate(self._lyrics_timeline):
+            if t_sec <= t_karaoke:
+                cur_idx = i
+            else:
+                break
+
+        if cur_idx >= 0:
+            t_curr, cur_line = self._lyrics_timeline[cur_idx]
+            has_next = cur_idx + 1 < len(self._lyrics_timeline)
+            t_next, next_line = self._lyrics_timeline[cur_idx + 1] if has_next else (t_curr + 5.0, "")
+
+            line_dur = t_next - t_curr
+            sing_until = t_curr + min(line_dur - 0.7, 5.0) if line_dur > 5.5 else t_next
+
+            if t_karaoke <= sing_until:
+                self._is_singing = True
+                if cur_idx != self._current_lyric_idx:
+                    self._current_lyric_idx = cur_idx
+                    self._show_karaoke_line(cur_line, next_line, now)
+            else:
+                self._is_singing = False
+                if self._current_lyric_idx != -2:
+                    self._current_lyric_idx = -2
+                    if t_next - t_karaoke > 2.5:
+                        self._hide_bubble()
+
+        self._reschedule_karaoke_switch()
+
+    def _show_karaoke_line(self, current_text: str, next_text: str, now: float):
+        if self._bubble is None or self._bubble_text is None:
+            return
+        try:
+            bg = GradientDrawable()
+            bg.setCornerRadius(float(AndroidUtilities.dp(13)))
+            bg.setColor(as_java_color(0xEE1A1A1E))
+            bg.setStroke(max(1, AndroidUtilities.dp(1)), as_java_color(0x33FFFFFF))
+            self._bubble.setBackground(bg)
+
+            self._bubble_text.setTextColor(as_java_color(0xFFFFFFFF))
+            self._bubble_text.setText(current_text)
+
+            if next_text and self._bubble_subtext is not None:
+                self._bubble_subtext.setText(next_text)
+                self._bubble_subtext.setTextColor(0x77FFFFFF)
+                self._bubble_subtext.setVisibility(View.VISIBLE)
+            elif self._bubble_subtext is not None:
+                self._bubble_subtext.setVisibility(View.GONE)
+
+            if self._media_controls_layout is not None and self._cfg.get("media_controls", True):
+                self._media_controls_layout.setVisibility(View.VISIBLE)
+
+            self._bubble.setVisibility(View.VISIBLE)
+            self._bubble.setAlpha(1.0)
+            self._bubble_visible = True
+            self._bubble_until = now + 9.0
+        except Exception as e:
+            CLOG.log_error("KARAOKE_UI", "Show line error", e)
+
+    # 2.3 Механика Tap-to-Sync (Выбор строки)
+    def _open_tap_to_sync_dialog(self):
+        try:
+            ctx = self._get_safe_activity()
+            if not ctx:
+                return
+            if not self._lyrics_timeline:
+                self._say("Слова ещё не загружены!", force=True)
+                return
+
+            items = []
+            for t_sec, text in self._lyrics_timeline:
+                mm = int(t_sec // 60)
+                ss = int(t_sec % 60)
+                items.append(f"[{mm:02d}:{ss:02d}] {text}")
+
+            b = AlertDialog.Builder(ctx)
+            b.setTitle("Tap-to-Sync: Выберите строку трека")
+
+            def _on_line_selected(_d, which):
+                if 0 <= which < len(self._lyrics_timeline):
+                    t_line, selected_text = self._lyrics_timeline[which]
+                    now = time.monotonic()
+                    t_calc_raw = self._get_current_track_pos(now)
+                    # Формула: _user_offset = T_line - T_calc_raw
+                    new_offset = t_line - t_calc_raw
+                    self._user_offset = new_offset
+
+                    # Сохраняем в память сессии
+                    if self._current_track_id:
+                        self._session_offsets[self._current_track_id] = new_offset
+
+                    CLOG.log_info(
+                        "SYNC",
+                        f"Калибровка Tap-to-Sync: строка #{which} '{selected_text}', new_offset={new_offset:.3f}с",
+                        line_index=which,
+                        offset=f"{new_offset:.3f}",
+                    )
+                    self._show_karaoke_line(selected_text, "", now)
+                    self._reschedule_karaoke_switch()
+
+            b.setItems(items, DialogClickListener(_on_line_selected))
+            b.setPositiveButton("Закрыть", None)
+            b.show()
+        except Exception as e:
+            CLOG.log_error("SYNC_DIALOG", "Dialog error", e)
+
+    def _start_custom_song(self, raw_input: str):
+        a, t = self._lyrics_helper.clean_metadata("", raw_input)
+        track_id = f"custom::{a}::{t}"
+        if track_id == self._current_track_id and self._is_singing:
+            return
+        self._current_track_id = track_id
+        self._lyrics_timeline = []
+        self._current_lyric_idx = -1
+        self._is_singing = True
+        self._media = "music"
+        self._track_is_playing = True
+        self._track_base_pos = 0.0
+        self._track_base_time = time.monotonic()
+        self._user_offset = self._session_offsets.get(f"{a} - {t}", 0.0)
+
+        self._say_track_detected(a, t)
+
+        def _on_loaded(tl):
+            def _apply():
+                self._lyrics_timeline = tl
+                if not tl:
+                    self._say("no_lyrics")
+                self._reschedule_karaoke_switch()
+            run_on_ui_thread(_apply)
+
+        self._lyrics_helper.get_lyrics_async(a, t, _on_loaded)
+
+    def _format_phrase(self, text: str, name: Optional[str] = None) -> str:
+        t_now = time.strftime("%H:%M")
+        res = text.replace("{time}", t_now)
+        res = res.replace("{battery}", str(self._battery_level))
+        res = res.replace("{name}", name or "")
+        return res
+
+    def _say(self, category, force=False, name=None):
+        if self._is_singing or self._bubble is None:
+            return
+        if not force and not self._cfg.get("phrases", True):
+            return
+        phrases = PHRASES.get(category, [category])
+        if name is None:
+            phrases = [p for p in phrases if "{name}" not in p] or phrases
+        raw_text = random.choice([p for p in phrases if p != self._last_phrase] or phrases)
+        text = self._format_phrase(raw_text, name)
+        self._last_phrase = text
+        now = time.monotonic()
+
+        try:
+            bg = GradientDrawable()
+            bg.setCornerRadius(float(AndroidUtilities.dp(12)))
+            bg.setColor(Theme.getColor(Theme.key_windowBackgroundWhite))
+            bg.setStroke(max(1, AndroidUtilities.dp(1)), Theme.getColor(Theme.key_divider))
+            self._bubble.setBackground(bg)
+
+            if self._bubble_text is not None:
+                self._bubble_text.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlackText))
+                self._bubble_text.setText(text)
+            if self._bubble_subtext is not None:
+                self._bubble_subtext.setVisibility(View.GONE)
+            if self._media_controls_layout is not None:
+                self._media_controls_layout.setVisibility(View.GONE)
+
+            self._bubble.animate().cancel()
+            self._bubble.setAlpha(0.0)
+            self._bubble.setVisibility(View.VISIBLE)
+            self._bubble_gen += 1
+            self._bubble_visible = True
+            self._bubble_fade_in = True
+            self._bubble_until = now + 2.0 + len(text) * 0.05
+        except Exception as e:
+            CLOG.log_error("BUBBLE", "Bubble text error", e)
+
+    def _hide_bubble(self):
+        if self._bubble is None or not self._bubble_visible:
+            return
+        self._bubble_visible = False
+        self._bubble_fade_in = False
+        self._bubble_gen += 1
+        gen = self._bubble_gen
+        bubble = self._bubble
+
+        def _gone():
+            if gen == self._bubble_gen and bubble is not None:
+                bubble.setVisibility(View.GONE)
+
+        anim = bubble.animate().alpha(0.0).setDuration(180)
+        anim.withEndAction(R(_gone))
+        anim.start()
+
+    def _update_bubble(self, now, width, min_y):
+        if self._bubble is None or not self._bubble_visible:
+            return
+        if now >= self._bubble_until and not self._is_singing:
+            self._hide_bubble()
+            return
+        bw, bh = self._bubble.getWidth(), self._bubble.getHeight()
+        if bw <= 0:
+            return
+        margin = self._dp(4)
+        bx = clamp(self._x + self._w / 2.0 - bw / 2.0, margin, width - bw - margin)
+        by = self._y + self._hop_off + self._unit - bh - margin
+        if by < min_y:
+            by = self._y + self._hop_off + self._h + margin
+        self._bubble.setTranslationX(float(bx))
+        self._bubble.setTranslationY(float(by))
+        if self._bubble_fade_in:
+            self._bubble_fade_in = False
+            self._bubble.animate().alpha(1.0).setDuration(150).start()
+
+    # 3. «Абсолютный Обжора» 2.0 (Безопасное поедание любого View)
+    def _pick_target(self, top):
+        decor = self._decor
+        if decor is None:
+            return None
+        width, height = decor.getWidth(), decor.getHeight()
+        dloc = jarray(jint)([0, 0])
+        decor.getLocationInWindow(dloc)
+        loc = jarray(jint)([0, 0])
+
+        candidates = []
+        stack = [decor]
+        visited = 0
+        min_side_dp = self._dp(24)  # Минимальный размер стороны: не менее 24 dp
+
+        while stack and visited < 900:
+            view = stack.pop()
+            visited += 1
+
+            if view is None or view.getVisibility() != View.VISIBLE:
+                continue
+            try:
+                if float(view.getAlpha()) < 0.05:  # Пропускать элементы с alpha < 0.05
+                    continue
+            except Exception:
+                pass
+
+            # Исключение: собственные элементы плагина
+            if view.equals(self._pet) or view.equals(self._bubble):
+                continue
+            if any(view.equals(p) for p in self._poops):
+                continue
+            if any(item.get("view_ref") and view.equals(item["view_ref"].get()) for item in self._eaten):
+                continue
+
+            count = view.getChildCount() if isinstance(view, ViewGroup) else 0
+            has_children = count > 0
+            if has_children:
+                for i in range(count):
+                    child = view.getChildAt(i)
+                    if child is not None:
+                        stack.append(child)
+                # Пропускать пустые контейнеры без фона/отрисовки
+                if view.getBackground() is None:
+                    continue
+
+            w, h = view.getWidth(), view.getHeight()
+            if w < min_side_dp or h < min_side_dp:
+                continue
+            if w >= width * 0.95 and h >= height * 0.95:
+                continue
+
+            view.getLocationInWindow(loc)
+            x = loc[0] - dloc[0]
+            y = loc[1] - dloc[1]
+            if x + w <= 0 or y + h <= top or x >= width or y >= height:
+                continue
+
+            # Приоритет элементу с наименьшей площадью (W x H)
+            area = float(w * h)
+            is_container = isinstance(view, ViewGroup) and has_children
+            candidates.append((view, x, y, w, h, area, is_container))
+
+        if not candidates:
+            return None
+
+        # Контейнеры целиком (ViewGroup) выбираются только при отсутствии подходящих дочерних элементов
+        leaf_candidates = [c for c in candidates if not c[6]]
+        pool = leaf_candidates if leaf_candidates else candidates
+
+        cx = self._x + self._w / 2.0
+        cy = self._y + self._h / 2.0
+        reach = self._dp(220)
+
+        # Вес: наименьшая площадь + близость к питомцу
+        def _score(item):
+            _, x, y, w, h, area, _ = item
+            dist = math.hypot(x + w / 2.0 - cx, y + h / 2.0 - cy)
+            return (area ** 0.5) * (1.0 + dist / reach)
+
+        pool.sort(key=_score)
+        chosen = pool[0]
+        return (chosen[0], chosen[1], chosen[2], chosen[3], chosen[4])
+
+    def _try_eat(self, now, top):
+        try:
+            target = self._pick_target(top)
+            if target is None:
+                return False
+            view, x, y, w, h = target
+
+            # 3.4 Управление памятью: масштабирование снимка (длинная сторона <= 256 px)
+            max_side = max(w, h)
+            scale = min(1.0, 256.0 / max(1, max_side))
+            bmp_w = max(1, int(w * scale))
+            bmp_h = max(1, int(h * scale))
+
+            bmp = Bitmap.createBitmap(bmp_w, bmp_h, Bitmap.Config.ARGB_8888)
+            canvas = Canvas(bmp)
+            if scale < 1.0:
+                canvas.scale(scale, scale)
+            canvas.translate(float(-view.getScrollX()), float(-view.getScrollY()))
+            view.draw(canvas)
+
+            orig_alpha = float(view.getAlpha())
+            cls_name = view.getClass().getSimpleName()
+
+            # 3.4 Ссылки хранятся строго через WeakReference!
+            item = {
+                "view_ref": WeakReference(view),
+                "alpha": orig_alpha,
+                "bmp": bmp,
+                "w": w,
+                "h": h,
+                "cls_name": cls_name,
+            }
+
+            # 3.3 Безопасность RecyclerView: регистрируем OnChildAttachStateChangeListener
+            parent = view.getParent()
+            while parent is not None:
+                if isinstance(parent, RecyclerView):
+                    listener = RecyclerAttachStateListener(self, view, orig_alpha)
+                    parent.addOnChildAttachStateChangeListener(listener)
+                    self._recycler_listeners.append((parent, listener))
+                    break
+                parent = parent.getParent()
+
+            view.setAlpha(0.0)
+
+            # Лимит желудка: максимум 12 элементов. При 13-м старейший автоматически выплёвывается
+            if len(self._eaten) >= MAX_EATEN:
+                oldest = self._eaten.pop(0)
+                self._spit_one(oldest, self._x + self._w / 2.0, self._y + self._h / 2.0, 0)
+
+            self._eaten.append(item)
+            self._schedule_auto_return()
+
+            copy = ImageView(self._pet.getContext())
+            copy.setImageBitmap(bmp)
+            copy.setScaleType(ImageView.ScaleType.FIT_XY)
+            index = max(0, self._decor.indexOfChild(self._pet))
+            self._decor.addView(copy, index, FrameLayout.LayoutParams(w, h))
+            self._flying.append(copy)
+
+            copy.setTranslationX(float(x))
+            copy.setTranslationY(float(y))
+
+            mx = self._x + self._w / 2.0
+            my = self._y + self._hop_off + self._unit * 8.0
+            self._look = 1 if x + w / 2.0 > mx else -1
+            self._mouth_open_until = now + 0.7
+            self._chew_until = 0.0
+            self._next_action = now + 3.0
+            self._next_eat = now + random.uniform(25.0, 70.0)
+
+            anim = copy.animate()
+            anim.translationX(float(mx - w / 2.0)).translationY(float(my - h / 2.0))
+            anim.scaleX(0.05).scaleY(0.05)
+            anim.rotation(float(random.choice((-1, 1)) * random.uniform(120.0, 300.0)))
+            anim.setInterpolator(AccelerateInterpolator(1.6))
+            anim.setDuration(560)
+            anim.withEndAction(R(lambda v=copy, cn=cls_name: self._on_swallowed(v, cn)))
+            anim.start()
+            return True
+        except Exception as e:
+            CLOG.log_error("EAT", "Eat animation error", e)
+            return False
+
+    def _schedule_auto_return(self):
+        # 3.5 Селектор автовозврата: 30 секунд, 2 минуты, 10 минут
+        if self._handler is None or self._auto_return_r is None:
+            return
+        self._handler.removeCallbacks(self._auto_return_r)
+        idx = clamp(int(self._cfg.get("auto_return", 1)), 0, len(AUTO_RETURN_SECONDS) - 1)
+        sec = AUTO_RETURN_SECONDS[idx]
+        self._handler.postDelayed(self._auto_return_r, int(sec * 1000.0))
+
+    def _on_auto_return_triggered(self):
+        CLOG.log_info("AUTO_RETURN", "Сработал таймер автовозврата: выплёвывание всего съеденного")
+        self._give_back()
+
+    def _on_recycler_cell_detached(self, view):
+        # Ячейка списка откреплена при скролле
+        CLOG.log_debug("RECYCLER", "Ячейка списка откреплена, alpha восстановлена")
+
+    def _on_swallowed(self, copy, cls_name: str):
+        try:
+            self._flying.remove(copy)
+        except ValueError:
+            pass
+        self._remove_view(copy)
+        if self._pet is None:
+            return
+        now = time.monotonic()
+        self._mouth_open_until = 0.0
+        self._chew_until = now + 1.4
+        self._squash_until = now + 0.12
+        self._set_expr("happy", 1.6)
+        self._haptic(3)
+
+        try:
+            self.set_setting("eaten_count", int(self.get_setting("eaten_count", 0) or 0) + 1)
+        except Exception:
+            pass
+
+        # 3.6 Классификация реплик по типу съеденного View
+        cn_lower = cls_name.lower()
+        if "edittext" in cn_lower or "input" in cn_lower:
+            self._say("eat_edittext")
+        elif "message" in cn_lower or "chatmessagecell" in cn_lower or "text" in cn_lower:
+            self._say("eat_message")
+        elif "actionbar" in cn_lower or "toolbar" in cn_lower or "header" in cn_lower:
+            self._say("eat_header")
+        elif "avatar" in cn_lower or "backupimageview" in cn_lower or "round" in cn_lower:
+            self._say("eat_avatar")
+        else:
+            fat = self._fat_stage()
+            if fat == 1:
+                self._say("eat_chubby")
+            elif fat == 2:
+                self._say("eat_fat")
+            elif fat == 3:
+                self._say("eat_balloon")
+            else:
+                self._say("eat")
+
+        if self._cfg.get("poop", True):
+            try:
+                meter = int(self.get_setting("poop_meter", 0) or 0) + 1
+                if meter >= self._poop_need:
+                    meter = 0
+                    self._poop_need = random.randint(*POOP_EVERY)
+                    self._poop_due = now + random.uniform(5.0, 10.0)
+                self.set_setting("poop_meter", meter)
+            except Exception:
+                pass
+
+    def _do_poop(self, now, min_x, max_x):
+        self._poop_due = 0.0
+        if not self._cfg.get("poop", True) or self._decor is None or self._pet is None:
+            return
+        if len(self._poops) >= MAX_POOPS:
+            return
+
+        is_gold = random.random() < 0.1
+        side = -self._look if self._look else random.choice((-1, 1))
+        try:
+            bmp = self._particle_bitmap("poop", is_gold=is_gold)
+            bw, bh = bmp.getWidth(), bmp.getHeight()
+            pad = AndroidUtilities.dp(6)
+            view = ImageView(self._pet.getContext())
+            view.setImageBitmap(bmp)
+            view.setScaleType(ImageView.ScaleType.CENTER)
+            view.setPadding(pad, pad, pad, pad)
+            if self._poop_listener is None:
+                self._poop_listener = PoopClickListener(self)
+            view.setOnClickListener(self._poop_listener)
+
+            index = max(0, self._decor.indexOfChild(self._pet))
+            self._decor.addView(view, index, FrameLayout.LayoutParams(bw + pad * 2, bh + pad * 2))
+            feet = self._y + self._unit * 12
+            px = self._x + self._w / 2.0 + side * self._w * 0.42 - bw / 2.0 - pad
+            px = clamp(px, 0.0, float(self._decor.getWidth() - bw - pad * 2))
+            view.setTranslationX(float(px))
+            view.setTranslationY(float(feet - bh - pad))
+            view.setScaleX(0.1)
+            view.setScaleY(0.1)
+            view.animate().scaleX(1.0).scaleY(1.0).setInterpolator(OvershootInterpolator(2.0)).setDuration(320).start()
+            self._poops.append(view)
+        except Exception as e:
+            CLOG.log_error("POOP", "Create poop error", e)
+            return
+
+        self._squash_until = now + 0.2
+        self._set_expr("happy", 1.8)
+        self._haptic(3)
+        self._say("poop_gold" if is_gold else "poop")
+        if is_gold:
+            for _ in range(4):
+                self._spawn_particle("spark")
+
+    def _clean_poop(self, view):
+        target = None
+        for p in self._poops:
+            if p.equals(view):
+                target = p
+                break
+        if target is None:
+            return
+        self._poops.remove(target)
+        target.setClickable(False)
+        cx = float(target.getTranslationX()) + target.getWidth() / 2.0
+        cy = float(target.getTranslationY()) + target.getHeight() / 2.0
+        for _ in range(3):
+            self._spawn_particle("spark", origin=(cx, cy))
+        target.animate().scaleX(0.0).scaleY(0.0).alpha(0.0).setDuration(250).withEndAction(
+            R(lambda v=target: self._remove_view(v))
+        ).start()
+
+        try:
+            self.set_setting("poops_cleaned", int(self.get_setting("poops_cleaned", 0) or 0) + 1)
+        except Exception:
+            pass
+        self._haptic(3)
+        self._say("clean")
+
+    def _remove_poops(self):
+        for view in self._poops:
+            self._remove_view(view)
+        self._poops = []
+
+    def _prune_eaten(self):
+        kept = []
+        for item in self._eaten:
+            v = item["view_ref"].get() if item.get("view_ref") else None
+            if v is not None:
+                try:
+                    if float(v.getAlpha()) < 0.05:
+                        kept.append(item)
+                    else:
+                        # Если элемент уже кем-то восстановлен
+                        if item.get("bmp"):
+                            item["bmp"].recycle()
+                except Exception:
+                    pass
+            else:
+                # View был собран сборщиком мусора
+                if item.get("bmp"):
+                    item["bmp"].recycle()
+        self._eaten = kept
+
+    def _restore_all(self):
+        items = self._eaten + self._spitting
+        self._eaten, self._spitting = [], []
+        for view in list(self._flying):
+            self._remove_view(view)
+        self._flying = []
+
+        for item in items:
+            v = item["view_ref"].get() if item.get("view_ref") else None
+            if v is not None:
+                try:
+                    v.setAlpha(float(item["alpha"]))
+                except Exception:
+                    pass
+            if item.get("bmp"):
+                try:
+                    item["bmp"].recycle()
+                except Exception:
+                    pass
+
+        # Открепляем слушателей RecyclerView
+        for r_view, listener in self._recycler_listeners:
+            try:
+                r_view.removeOnChildAttachStateChangeListener(listener)
+            except Exception:
+                pass
+        self._recycler_listeners = []
+
+    def _give_back(self):
+        if self._eaten and self._pet is not None and self._decor is not None:
+            self._spit_all(time.monotonic())
+        else:
+            self._restore_all()
+
+    def _spit_all(self, now):
+        items = self._eaten
+        self._eaten = []
+        if not items:
+            return
+        if self._handler and self._auto_return_r:
+            self._handler.removeCallbacks(self._auto_return_r)
+
+        self._chew_until = 0.0
+        self._mouth_open_until = now + 0.35 + 0.08 * len(items)
+        self._set_expr("surprised", 0.9)
+        self._squash_until = now + 0.12
+        self._hop(self._dp(300))
+        self._haptic(1)
+        self._say("spit")
+
+        mx = self._x + self._w / 2.0
+        my = self._y + self._hop_off + self._unit * 8.0
+        for i, item in enumerate(items):
+            self._spit_one(item, mx, my, i * 70)
+        self._schedule(0)
+
+    def _spit_one(self, item, mx, my, delay):
+        view = item["view_ref"].get() if item.get("view_ref") else None
+        bmp = item.get("bmp")
+        w, h = item["w"], item["h"]
+
+        # Если View откреплен/переиспользован адаптером
+        if view is None or not view.isAttachedToWindow() or self._decor is None:
+            if view is not None:
+                try:
+                    view.setAlpha(float(item["alpha"]))
+                except Exception:
+                    pass
+            if bmp is not None:
+                try:
+                    bmp.recycle()
+                except Exception:
+                    pass
+            return
+
+        try:
+            dloc = jarray(jint)([0, 0])
+            loc = jarray(jint)([0, 0])
+            self._decor.getLocationInWindow(dloc)
+            view.getLocationInWindow(loc)
+            x, y = loc[0] - dloc[0], loc[1] - dloc[1]
+
+            self._spitting.append(item)
+            copy = ImageView(self._pet.getContext())
+            copy.setImageBitmap(bmp)
+            copy.setScaleType(ImageView.ScaleType.FIT_XY)
+            self._decor.addView(copy, FrameLayout.LayoutParams(w, h))
+
+            copy.setTranslationX(float(mx - w / 2.0))
+            copy.setTranslationY(float(my - h / 2.0))
+            copy.setScaleX(0.01)
+            copy.setScaleY(0.01)
+
+            def _done(v=copy, it=item, target=view):
+                self._remove_view(v)
+                try:
+                    self._spitting.remove(it)
+                except ValueError:
+                    pass
+                if target is not None:
+                    target.setAlpha(float(it["alpha"]))
+                if it.get("bmp"):
+                    try:
+                        it["bmp"].recycle()
+                    except Exception:
+                        pass
+
+            copy.animate().translationX(float(x)).translationY(float(y)).scaleX(1.0).scaleY(1.0).setDuration(450).setStartDelay(
+                int(delay)
+            ).setInterpolator(OvershootInterpolator(1.2)).withEndAction(R(_done)).start()
+        except Exception as e:
+            CLOG.log_error("SPIT", "Spit error", e)
+            if view is not None:
+                view.setAlpha(float(item["alpha"]))
+            if bmp is not None:
+                bmp.recycle()
+
+    def _poll_chat(self, now):
+        fragment = None
+        dialog_id = 0
+        try:
+            fragment = get_last_fragment()
+            if fragment is not None and isinstance(fragment, ChatActivity):
+                dialog_id = int(fragment.getDialogId())
+        except Exception:
+            dialog_id = 0
+
+        if dialog_id == self._chat_dialog:
+            try:
+                if fragment is not None and isinstance(fragment, ChatActivity):
+                    sub = getattr(fragment, "subtitleTextView", None)
+                    if sub is not None:
+                        txt = str(sub.getText() or "").lower()
+                        # Распознавать статус набора: печатает, typing, друкує
+                        if ("печатает" in txt or "typing" in txt or "друкує" in txt) and self._state in ("idle", "walk") and now >= self._next_action:
+                            self._set_expr("surprised", 1.2)
+                            self._say("typing")
+                            self._next_action = now + 5.0
+            except Exception:
+                pass
+            return
+
+        self._chat_dialog = dialog_id
+        if not dialog_id or not self._cfg.get("tg_events", True):
+            return
+        visits = self._chat_visits.pop(dialog_id, 0) + 1
+        self._chat_visits[dialog_id] = visits
+        if len(self._chat_visits) > MAX_CHAT_VISITS:
+            self._chat_visits.pop(next(iter(self._chat_visits)))
+        if now < self._next_chat_comment or self._state not in ("idle", "walk") or random.random() > 0.4:
+            return
+        self._next_chat_comment = now + 25.0
+
+        is_self, name = False, None
+        try:
+            u = fragment.getCurrentUser()
+            if u is not None:
+                is_self = UserObject.isUserSelf(u)
+                name = UserObject.getFirstName(u)
+            else:
+                c = fragment.getCurrentChat()
+                if c is not None:
+                    name = c.title
+        except Exception:
+            pass
+
+        if is_self:
+            self._say("chat_self")
+        elif visits > 1:
+            self._say("chat_again", name=name)
+        else:
+            self._say("chat_new", name=name)
+
+    def _set_expr(self, expr, duration):
+        self._expr = expr
+        self._expr_until = time.monotonic() + duration
+
+    def _hop(self, strength):
+        if self._state not in ("idle", "walk"):
+            return
+        self._hop_active = True
+        self._hop_vy = -float(strength)
+        if self._hop_off > 0:
+            self._hop_off = 0.0
+
+    def _haptic(self, kind):
+        if not self._cfg.get("haptics", True) or self._pet is None:
+            return
+        try:
+            self._pet.performHapticFeedback(kind)
+        except Exception:
+            pass
+
+    def _spawn_particle(self, kind, origin=None):
+        if self._decor is None or self._pet is None or len(self._particles) >= MAX_PARTICLES:
+            return
+        try:
+            bmp = self._particle_bitmap(kind)
+            bw, bh = bmp.getWidth(), bmp.getHeight()
+            view = ImageView(self._pet.getContext())
+            view.setImageBitmap(bmp)
+            self._decor.addView(view, FrameLayout.LayoutParams(bw, bh))
+            self._particles.append(view)
+
+            head_y = self._y + self._hop_off + self._unit * 2 - bh
+            if origin is not None:
+                sx = origin[0] - bw / 2.0 + random.uniform(-self._dp(8), self._dp(8))
+                sy = origin[1] - bh
+                drift = random.uniform(-self._dp(16), self._dp(16))
+            elif kind == "zzz":
+                sx = self._x + self._w * 0.72
+                sy = head_y + self._unit * 2
+                drift = self._dp(18)
+            else:
+                sx = self._x + self._w / 2.0 - bw / 2.0 + random.uniform(-self._w * 0.25, self._w * 0.25)
+                sy = head_y
+                drift = random.uniform(-self._dp(16), self._dp(16))
+
+            view.setTranslationX(float(sx))
+            view.setTranslationY(float(sy))
+            view.setScaleX(0.5)
+            view.setScaleY(0.5)
+            view.animate().translationXBy(float(drift)).translationYBy(float(-self._dp(random.uniform(40, 58)))).scaleX(
+                1.0
+            ).scaleY(1.0).alpha(0.0).setDuration(1100 if kind != "zzz" else 1600).withEndAction(
+                R(lambda v=view: self._remove_particle(v))
+            ).start()
+        except Exception as e:
+            CLOG.log_error("PARTICLE", "Spawn particle error", e)
+
+    def _remove_particle(self, view):
+        try:
+            self._particles.remove(view)
+        except ValueError:
+            pass
+        self._remove_view(view)

@@ -1,0 +1,6 @@
+{
+  "name": "Clawd Studio v3.4",
+  "description": "Студия интерактивного питомца Clawd v3.4 для Telegram: генератор плагина, симулятор, Clawd Bridge и верификатор ТЗ.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
