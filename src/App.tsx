@@ -682,6 +682,54 @@ export default function App() {
                   badge: 'Багфикс 1.5: ОК',
                 },
                 {
+                  id: 'fix-341-1',
+                  title: 'Правка 3.4.1.1: Защита караоке-петли от остановки при прыжке/тапе',
+                  status: 'PASS',
+                  details:
+                    'Если в момент тика караоке питомец находится в воздухе или под пальцем, таймер не умирает, а перезапускается через postDelayed(r, 120ms).',
+                  badge: '3.4.1: Loop Alive',
+                },
+                {
+                  id: 'fix-341-2',
+                  title: 'Правка 3.4.1.2: Тап-побег (+15% скорости, прыжок наверх и реплика tap_flee)',
+                  status: 'PASS',
+                  details:
+                    'Одиночный тап активирует бег от центра экрана на 140dp со скоростью +15% (3-4с), высокий прыжок на 560dp со дна и реплики tap_flee.',
+                  badge: '3.4.1: Tap Flee',
+                },
+                {
+                  id: 'fix-341-3',
+                  title: 'Правка 3.4.1.3: Отрисовка красной точки лазера при мультитаче',
+                  status: 'PASS',
+                  details:
+                    'При двух пальцах создаётся круглый маркер 10x10dp с красным градиентом 0xFFFF0033 под вторым пальцем. При отпускании точка мгновенно удаляется.',
+                  badge: '3.4.1: Red Laser Dot',
+                },
+                {
+                  id: 'fix-341-4',
+                  title: 'Правка 3.4.1.4: Защита Canvas от recycled bitmap краша (_restore_all / _spit_all)',
+                  status: 'PASS',
+                  details:
+                    'Перед bmp.recycle() принудительно вызывается copy.setImageBitmap(None) и copy.animate().cancel(), а ссылка item["bmp"] обнуляется.',
+                  badge: '3.4.1: Bitmap Safe',
+                },
+                {
+                  id: 'fix-341-5',
+                  title: 'Правка 3.4.1.5: MAX_FRAME_CACHE = 128 и переработка старых кадров',
+                  status: 'PASS',
+                  details:
+                    'Лимит кэша увеличен с 64 до 128 (для Радужного RGB скина), вытесняемые Bitmap утилизируются через explicit .recycle() без GC churn.',
+                  badge: '3.4.1: 128 Cache',
+                },
+                {
+                  id: 'fix-341-6',
+                  title: 'Правка 3.4.1.6: Предотвращение утечки RecyclerAttachStateListener',
+                  status: 'PASS',
+                  details:
+                    'Перед добавлением слушателя проверяется наличие существующего на данном RecyclerView; при очистке вызывается removeOnChildAttachStateChangeListener.',
+                  badge: '3.4.1: No Leak',
+                },
+                {
                   id: '3',
                   title: '3. Математика синхронизации и сдвига (T_calc + _user_offset, Jitter > 0.25c)',
                   status: 'PASS',

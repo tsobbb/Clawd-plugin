@@ -178,6 +178,7 @@ PHRASES = {
         "Скучновато… скинь мем!", "Сейчас {time}, продуктивно!",
     ],
     "tap": ["Ой!", "Эй!", "Чего?", "Я тут!", "Хи!", "Не щекочи!"],
+    "tap_flee": ["Не догонишь!", "Я побежал!", "Побег!", "Хи-хи, догоняй!", "Ой, щекотно!", "Быстрее ветра!"],
     "annoyed": ["Хватит тыкать!", "Щекотно же!", "Ну всё, обиделся", "Эй, полегче!", "Я тебе не кнопка!"],
     "pet": ["Мрр…", "Ещё!", "Приятно ♥", "Хи-хи", "Лучший день!", "♥♥♥", "Мур-мур-мур"],
     "drag": ["Ааа!", "Куда мы?", "Поставь меня!", "Головокружение!", "Лечу-у-у!"],
@@ -295,7 +296,7 @@ MAX_KEYWORD_TEXT = 400
 MAX_SCAN_MESSAGES = 10
 MAX_CHAT_VISITS = 200
 MAX_PARTICLES = 16
-MAX_FRAME_CACHE = 64
+MAX_FRAME_CACHE = 128
 MAX_EATEN = 12
 MAX_POOPS = 3
 POOP_EVERY = (3, 6)
@@ -1852,7 +1853,13 @@ class ClawdPetPlugin(BasePlugin):
         bmp = self._frames.get(key)
         if bmp is None:
             if len(self._frames) >= MAX_FRAME_CACHE:
-                self._frames.pop(next(iter(self._frames)))
+                old_key = next(iter(self._frames))
+                old_bmp = self._frames.pop(old_key)
+                if old_bmp is not None and old_bmp != getattr(self, "_last_rendered_bmp", None):
+                    try:
+                        old_bmp.recycle()
+                    except Exception:
+                        pass
             bmp = self._render_frame(key)
             self._frames[key] = bmp
         return bmp
@@ -2391,9 +2398,13 @@ class ClawdPetPlugin(BasePlugin):
         return 3
 
     def _step_ground(self, dt, now, gravity, min_x, max_x, min_y, max_y):
+        self._min_x, self._max_x, self._min_y, self._max_y = min_x, max_x, min_y, max_y
         self._walk_in = False
         fat = self._fat_stage()
         speed_factor = [1.0, 0.85, 0.65, 0.45][fat]
+        # 2. Ускорение бега на +15% при тап-побеге
+        if now < getattr(self, "_flee_boost_until", 0.0):
+            speed_factor *= 1.15
 
         if self._state != "walk":
             if self._x < min_x - 0.5 or self._x > max_x + 0.5:
@@ -3068,12 +3079,14 @@ class ClawdPetPlugin(BasePlugin):
             except Exception:
                 lx, ly = rx, ry
             self._run_towards(lx, ly)
+            self._update_laser_view(lx, ly, True)
             if random.random() < 0.15:
                 self._say("laser_chase")
             return True
         else:
             if self._laser_active:
                 self._laser_active = False
+                self._update_laser_view(0, 0, False)
 
         if action == MotionEvent.ACTION_DOWN:
             self._last_interaction = now
@@ -3120,6 +3133,7 @@ class ClawdPetPlugin(BasePlugin):
             return True
 
         if action in (MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL):
+            self._update_laser_view(0, 0, False)
             self._touch = None
             self._last_interaction = now
             state = self._state
@@ -3133,6 +3147,33 @@ class ClawdPetPlugin(BasePlugin):
             self._schedule(0)
             return True
         return True
+
+    def _update_laser_view(self, x: float, y: float, visible: bool):
+        try:
+            if not visible:
+                if self._laser_view is not None:
+                    self._laser_view.setVisibility(View.GONE)
+                return
+
+            size = self._dp(10)
+            if self._laser_view is None and self._decor is not None:
+                ctx = self._decor.getContext()
+                lv = View(ctx)
+                gd = GradientDrawable()
+                gd.setShape(GradientDrawable.OVAL)
+                gd.setColor(as_java_color(0xFFFF0033))
+                gd.setStroke(max(1, self._dp(2)), as_java_color(0x66FF0033))
+                lv.setBackground(gd)
+                lp = FrameLayout.LayoutParams(size, size)
+                self._decor.addView(lv, lp)
+                self._laser_view = lv
+
+            if self._laser_view is not None:
+                self._laser_view.setVisibility(View.VISIBLE)
+                self._laser_view.setTranslationX(float(x - size / 2.0))
+                self._laser_view.setTranslationY(float(y - size / 2.0))
+        except Exception as e:
+            CLOG.log_error("LASER", "Laser view error", e)
 
     def _run_towards(self, tx: float, ty: float):
         self._look = 1 if tx > self._x else -1
@@ -3188,11 +3229,35 @@ class ClawdPetPlugin(BasePlugin):
             self._say("annoyed", force=True)
             self._haptic(1)
             return
+        # 2. Механика: Тап-побег (+15% скорости, прыжок наверх и реплика tap_flee)
         self._squash_until = now + 0.12
-        self._set_expr("surprised", 0.45)
-        self._hop(self._dp(330))
+        self._set_expr("happy", 1.8)
         self._haptic(3)
-        self._say("tap")
+        self._flee_boost_until = now + random.uniform(3.0, 4.0)
+
+        decor_w = float(self._decor.getWidth()) if self._decor is not None and self._decor.getWidth() > 0 else (getattr(self, "_max_x", 400.0) * 1.5)
+        mid_x = decor_w / 2.0
+        dist = self._dp(140)
+
+        min_x = getattr(self, "_min_x", 0.0)
+        max_x = getattr(self, "_max_x", self._x + dist)
+
+        if self._x + self._w / 2.0 >= mid_x:
+            self._walk_target = max(min_x, self._x - dist)
+            self._look = -1
+        else:
+            self._walk_target = min(max_x, self._x + dist)
+            self._look = 1
+        self._state = "walk"
+
+        # Если питомец в нижней половине экрана (Y > min_y + 100 dp) — высокий прыжок вверх на 560 dp
+        min_y = getattr(self, "_min_y", 0.0)
+        if self._y > min_y + self._dp(100):
+            self._hop(self._dp(560))
+        else:
+            self._hop(self._dp(340))
+
+        self._say("tap_flee")
 
     def _start_pet(self, now):
         self._state = "pet"
@@ -3585,9 +3650,15 @@ class ClawdPetPlugin(BasePlugin):
             or not self._lyrics_timeline
             or (self._media != "music" and not self._test_karaoke_active)
             or not self._track_is_playing
-            or self._state not in ("idle", "walk")
         ):
             self._is_singing = False
+            return
+
+        # 1.1 Защита от смерти караоке-петли при прыжке, перетаскивании или тапе
+        if self._state not in ("idle", "walk"):
+            self._is_singing = False
+            if self._handler and self._karaoke_switch_r:
+                self._handler.postDelayed(self._karaoke_switch_r, 120)
             return
 
         # 2.2 Если position_known == False
@@ -3941,12 +4012,15 @@ class ClawdPetPlugin(BasePlugin):
             }
 
             # 3.3 Безопасность RecyclerView: регистрируем OnChildAttachStateChangeListener
+            # 6.1 Проверяем, не прикреплен ли уже слушатель от плагина к данному экземпляру RecyclerView
             parent = view.getParent()
             while parent is not None:
                 if isinstance(parent, RecyclerView):
-                    listener = RecyclerAttachStateListener(self, view, orig_alpha)
-                    parent.addOnChildAttachStateChangeListener(listener)
-                    self._recycler_listeners.append((parent, listener))
+                    already = any(p is parent or (hasattr(p, "equals") and p.equals(parent)) for p, _ in self._recycler_listeners)
+                    if not already:
+                        listener = RecyclerAttachStateListener(self, view, orig_alpha)
+                        parent.addOnChildAttachStateChangeListener(listener)
+                        self._recycler_listeners.append((parent, listener))
                     break
                 parent = parent.getParent()
 
@@ -3963,6 +4037,7 @@ class ClawdPetPlugin(BasePlugin):
             copy = ImageView(self._pet.getContext())
             copy.setImageBitmap(bmp)
             copy.setScaleType(ImageView.ScaleType.FIT_XY)
+            item["copy"] = copy
             index = max(0, self._decor.indexOfChild(self._pet))
             self._decor.addView(copy, index, FrameLayout.LayoutParams(w, h))
             self._flying.append(copy)
@@ -4143,38 +4218,81 @@ class ClawdPetPlugin(BasePlugin):
                     if float(v.getAlpha()) < 0.05:
                         kept.append(item)
                     else:
-                        # Если элемент уже кем-то восстановлен
-                        if item.get("bmp"):
-                            item["bmp"].recycle()
+                        copy_v = item.get("copy")
+                        if copy_v is not None:
+                            try:
+                                copy_v.animate().cancel()
+                                copy_v.setImageBitmap(None)
+                            except Exception:
+                                pass
+                            item["copy"] = None
+                        bmp = item.get("bmp")
+                        if bmp is not None:
+                            item["bmp"] = None
+                            try:
+                                bmp.recycle()
+                            except Exception:
+                                pass
                 except Exception:
                     pass
             else:
-                # View был собран сборщиком мусора
-                if item.get("bmp"):
-                    item["bmp"].recycle()
+                copy_v = item.get("copy")
+                if copy_v is not None:
+                    try:
+                        copy_v.animate().cancel()
+                        copy_v.setImageBitmap(None)
+                    except Exception:
+                        pass
+                    item["copy"] = None
+                bmp = item.get("bmp")
+                if bmp is not None:
+                    item["bmp"] = None
+                    try:
+                        bmp.recycle()
+                    except Exception:
+                        pass
         self._eaten = kept
 
     def _restore_all(self):
         items = self._eaten + self._spitting
         self._eaten, self._spitting = [], []
         for view in list(self._flying):
+            try:
+                view.animate().cancel()
+                if hasattr(view, "setImageBitmap"):
+                    view.setImageBitmap(None)
+            except Exception:
+                pass
             self._remove_view(view)
         self._flying = []
 
         for item in items:
+            # 4. Предотвращение краша Canvas: trying to draw a recycled bitmap
+            copy_v = item.get("copy")
+            if copy_v is not None:
+                try:
+                    copy_v.animate().cancel()
+                    if hasattr(copy_v, "setImageBitmap"):
+                        copy_v.setImageBitmap(None)
+                except Exception:
+                    pass
+                item["copy"] = None
+
             v = item["view_ref"].get() if item.get("view_ref") else None
             if v is not None:
                 try:
                     v.setAlpha(float(item["alpha"]))
                 except Exception:
                     pass
-            if item.get("bmp"):
+            bmp = item.get("bmp")
+            if bmp is not None:
+                item["bmp"] = None
                 try:
-                    item["bmp"].recycle()
+                    bmp.recycle()
                 except Exception:
                     pass
 
-        # Открепляем слушателей RecyclerView
+        # 6.2 Гарантированно открепляем слушателей RecyclerView
         for r_view, listener in self._recycler_listeners:
             try:
                 r_view.removeOnChildAttachStateChangeListener(listener)
@@ -4223,6 +4341,7 @@ class ClawdPetPlugin(BasePlugin):
                 except Exception:
                     pass
             if bmp is not None:
+                item["bmp"] = None
                 try:
                     bmp.recycle()
                 except Exception:
@@ -4240,7 +4359,9 @@ class ClawdPetPlugin(BasePlugin):
             copy = ImageView(self._pet.getContext())
             copy.setImageBitmap(bmp)
             copy.setScaleType(ImageView.ScaleType.FIT_XY)
+            item["copy"] = copy
             self._decor.addView(copy, FrameLayout.LayoutParams(w, h))
+            self._flying.append(copy)
 
             copy.setTranslationX(float(mx - w / 2.0))
             copy.setTranslationY(float(my - h / 2.0))
@@ -4248,16 +4369,31 @@ class ClawdPetPlugin(BasePlugin):
             copy.setScaleY(0.01)
 
             def _done(v=copy, it=item, target=view):
+                try:
+                    v.animate().cancel()
+                    v.setImageBitmap(None)
+                except Exception:
+                    pass
                 self._remove_view(v)
+                try:
+                    self._flying.remove(v)
+                except ValueError:
+                    pass
                 try:
                     self._spitting.remove(it)
                 except ValueError:
                     pass
+                it["copy"] = None
                 if target is not None:
-                    target.setAlpha(float(it["alpha"]))
-                if it.get("bmp"):
                     try:
-                        it["bmp"].recycle()
+                        target.setAlpha(float(it["alpha"]))
+                    except Exception:
+                        pass
+                bmp_ref = it.get("bmp")
+                if bmp_ref is not None:
+                    it["bmp"] = None
+                    try:
+                        bmp_ref.recycle()
                     except Exception:
                         pass
 
@@ -4267,9 +4403,24 @@ class ClawdPetPlugin(BasePlugin):
         except Exception as e:
             CLOG.log_error("SPIT", "Spit error", e)
             if view is not None:
-                view.setAlpha(float(item["alpha"]))
+                try:
+                    view.setAlpha(float(item["alpha"]))
+                except Exception:
+                    pass
+            copy_v = item.get("copy")
+            if copy_v is not None:
+                try:
+                    copy_v.animate().cancel()
+                    copy_v.setImageBitmap(None)
+                except Exception:
+                    pass
+                item["copy"] = None
             if bmp is not None:
-                bmp.recycle()
+                item["bmp"] = None
+                try:
+                    bmp.recycle()
+                except Exception:
+                    pass
 
     def _poll_chat(self, now):
         fragment = None

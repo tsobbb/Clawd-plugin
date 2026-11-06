@@ -72,3 +72,52 @@ test('Clawd v3.4 contains all 5 critical bugfixes from ТЗ', () => {
     '2.5: Missing climber instinct for ascending from screen bottom'
   );
 });
+
+test('Clawd v3.4.1 contains all 6 enhancements from Правка 3.4.1', () => {
+  const filePath = path.resolve(process.cwd(), 'public/clawd_v3_4.py');
+  const code = fs.readFileSync(filePath, 'utf-8');
+
+  // 1. Karaoke loop survival during hops/taps
+  assert.ok(
+    code.includes('postDelayed(self._karaoke_switch_r, 120)'),
+    '3.4.1.1: Missing 120ms reschedule when state is not idle/walk'
+  );
+
+  // 2. Tap-flee mechanic (+15% speed and jump upwards)
+  assert.ok(
+    code.includes('tap_flee') && code.includes('_flee_boost_until') && code.includes('speed_factor *= 1.15'),
+    '3.4.1.2: Missing tap_flee phrase, boost timer, or 15% speed multiplication'
+  );
+
+  // 3. Laser dot visual rendering
+  assert.ok(
+    code.includes('_update_laser_view') && code.includes('0xFFFF0033'),
+    '3.4.1.3: Missing laser view creation and red gradient drawing'
+  );
+
+  // 4. Recycled bitmap safety
+  assert.ok(
+    code.includes('view.setImageBitmap(None)') || code.includes('copy.setImageBitmap(None)'),
+    '3.4.1.4: Missing setImageBitmap(None) before bitmap recycling'
+  );
+  assert.ok(
+    code.includes('animate().cancel()'),
+    '3.4.1.4: Missing animate().cancel() before bitmap recycling'
+  );
+
+  // 5. MAX_FRAME_CACHE = 128 and frame bitmap recycling
+  assert.ok(
+    code.includes('MAX_FRAME_CACHE = 128'),
+    '3.4.1.5: MAX_FRAME_CACHE must be increased to 128'
+  );
+  assert.ok(
+    code.includes('old_bmp.recycle()'),
+    '3.4.1.5: Missing explicit old_bmp.recycle() on frame eviction'
+  );
+
+  // 6. Recycler listener leak prevention
+  assert.ok(
+    code.includes('already = any(p is parent') || code.includes('already_attached'),
+    '3.4.1.6: Missing already-attached listener check before adding to RecyclerView'
+  );
+});
