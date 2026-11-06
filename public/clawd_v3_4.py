@@ -616,11 +616,26 @@ class RecyclerAttachStateListener(dynamic_proxy(RecyclerView.OnChildAttachStateC
     def onChildViewDetachedFromWindow(self, view):
         try:
             target = self.target_ref.get() if self.target_ref else None
-            if target is not None and (view.equals(target) or view is target):
-                # Мгновенно восстанавливаем alpha при откреплении (скролле) или переиспользовании адаптером!
-                target.setAlpha(float(self.original_alpha))
-                if self.plugin:
-                    self.plugin._on_recycler_cell_detached(target)
+            if target is not None:
+                # 1.5 Иерархическая проверка: прямое совпадение или принадлежность поддереву открепляемой ячейки
+                is_match = False
+                if view.equals(target) or (view is target):
+                    is_match = True
+                else:
+                    curr = target.getParent()
+                    while curr is not None:
+                        if curr.equals(view) or (curr is view):
+                            is_match = True
+                            break
+                        if hasattr(curr, "getParent"):
+                            curr = curr.getParent()
+                        else:
+                            break
+                if is_match:
+                    # Мгновенно восстанавливаем alpha при откреплении (скролле) ячейки
+                    target.setAlpha(float(self.original_alpha))
+                    if self.plugin:
+                        self.plugin._on_recycler_cell_detached(target)
         except Exception as e:
             CLOG.log_error("RECYCLER", "Attach listener error", e)
 
@@ -1084,6 +1099,9 @@ class ClawdPetPlugin(BasePlugin):
             with open(sync_fp, "r", encoding="utf-8") as f:
                 d = json.load(f)
             ts = float(d.get("timestamp", 0))
+            # 1.1 Нормализация timestamp: если в миллисекундах (> 1e11), приводим к секундам
+            if ts > 1e11:
+                ts = ts / 1000.0
             # Считывается только если timestamp внутри файла не старше 5 секунд!
             if abs(time.time() - ts) <= 5.0:
                 # Извлекаются исключительно artist и title для поиска текста!
@@ -2401,8 +2419,14 @@ class ClawdPetPlugin(BasePlugin):
                 return
             else:
                 self._y = min(self._y, max_y)
-                if random.random() < 0.02 and not self._hop_active and self._platforms:
-                    self._hop(self._dp(500))
+                # 2.5 Инстинкт скалолаза: если сидит на дне экрана, каждые 2-4с ищет платформы выше и прыгает вверх
+                if not self._hop_active and now >= getattr(self, "_next_climb_attempt", 0.0):
+                    self._next_climb_attempt = now + random.uniform(2.0, 4.0)
+                    platforms_above = [p for p in self._platforms if p[4] < self._y - self._dp(35)]
+                    if platforms_above:
+                        self._hop(self._dp(550))
+                elif random.random() < 0.015 and not self._hop_active and self._platforms:
+                    self._hop(self._dp(450))
             if self._step_slide(dt, now, min_x, max_x):
                 return
         else:
@@ -3391,6 +3415,8 @@ class ClawdPetPlugin(BasePlugin):
 
         if track_title:
             clean_a, clean_t = self._lyrics_helper.clean_metadata(track_artist, track_title)
+            self._last_active_clean_a = clean_a
+            self._last_active_clean_t = clean_t
             # Смена трека фиксируется строго по тройке (player, artist, title)
             triplet_id = f"{player_name}::{clean_a}::{clean_t}"
             if triplet_id != self._current_track_id:
@@ -3436,6 +3462,10 @@ class ClawdPetPlugin(BasePlugin):
             t_calc = self._get_current_track_pos(now)
             drift = abs(t_new - t_calc)
 
+            # 1.2 Отслеживание перехода пауза -> возобновление (resumed)
+            was_paused = not self._track_is_playing
+            resumed = is_playing and was_paused
+
             if not is_playing:
                 # Пауза: значение T_calc замораживается на месте
                 self._track_is_playing = False
@@ -3445,12 +3475,20 @@ class ClawdPetPlugin(BasePlugin):
                     self._handler.removeCallbacks(self._karaoke_switch_r)
             else:
                 self._track_is_playing = True
-                # Джиттер-фильтр: перезаписываем базу только если drift > 0.25 с!
-                if drift > 0.25 or self._track_base_time == 0.0:
-                    CLOG.log_debug("JITTER", f"Дрейф базы > 0.25с ({drift*1000:.0f}мс): обновление базы", drift_ms=f"{drift*1000:.0f}")
+                # База обязана принудительно обновляться в трёх случаях:
+                # 1) Дрейф превысил порог: drift > 0.25;
+                # 2) Первый запуск трека: _track_base_time == 0.0;
+                # 3) Снятие с паузы: resumed == True.
+                if drift > 0.25 or self._track_base_time == 0.0 or resumed:
+                    CLOG.log_debug(
+                        "JITTER",
+                        f"Обновление базы: drift={drift*1000:.0f}мс resumed={resumed}",
+                        drift_ms=f"{drift*1000:.0f}",
+                        resumed=resumed,
+                    )
                     self._track_base_pos = t_new
                     self._track_base_time = now
-                    # Перерасчет таймера караоке при коррекции базы
+                    # Немедленный перерасчет таймера караоке
                     self._reschedule_karaoke_switch()
         else:
             self._track_is_playing = False
@@ -3494,7 +3532,7 @@ class ClawdPetPlugin(BasePlugin):
         t_calc_raw = self._get_current_track_pos(now)
         t_karaoke = t_calc_raw + self._user_offset
 
-        # Находим текущую строку
+        # Находим текущую строку и следующую
         cur_idx = -1
         next_idx = -1
         for i, (t_sec, _) in enumerate(self._lyrics_timeline):
@@ -3504,14 +3542,38 @@ class ClawdPetPlugin(BasePlugin):
                 next_idx = i
                 break
 
-        delay_ms = 350
-        if next_idx >= 0:
-            t_next_line = self._lyrics_timeline[next_idx][0]
-            delta_sec = t_next_line - t_karaoke
-            delay_ms = max(30, int(delta_sec * 1000.0))  # не менее 30 мс
-        elif cur_idx >= 0:
-            delay_ms = 4000
+        # 1.3 Устранение зависания рта и строки на инструментальных паузах
+        wake_at = t_karaoke + 0.35
+        if cur_idx >= 0:
+            t_curr = self._lyrics_timeline[cur_idx][0]
+            if next_idx >= 0:
+                t_next_line = self._lyrics_timeline[next_idx][0]
+                line_dur = t_next_line - t_curr
+                # Если длительность строки > 5.5 с: sing_until = T_curr + min(line_dur - 0.7, 5.0)
+                # Иначе: sing_until = T_next_line
+                sing_until = t_curr + min(line_dur - 0.7, 5.0) if line_dur > 5.5 else t_next_line
 
+                # Точка следующего пробуждения таймера (wake_at):
+                if t_karaoke < sing_until:
+                    # Строка ещё поётся: цель — закрыть рот и скрыть облачко вовремя
+                    wake_at = sing_until
+                else:
+                    # Строка уже спета, но следующая ещё не началась (инструментальный проигрыш)
+                    wake_at = t_next_line
+            else:
+                # Трек закончился / последняя строка
+                sing_until = t_curr + 5.0
+                if t_karaoke < sing_until:
+                    wake_at = sing_until
+                else:
+                    wake_at = t_karaoke + 4.0
+        elif next_idx >= 0:
+            # До начала первой вокальной партии (интро)
+            wake_at = self._lyrics_timeline[next_idx][0]
+        else:
+            wake_at = t_karaoke + 4.0
+
+        delay_ms = max(30, int((wake_at - t_karaoke) * 1000.0))
         self._handler.postDelayed(self._karaoke_switch_r, delay_ms)
 
     def _do_karaoke_line_switch(self):
@@ -3562,8 +3624,7 @@ class ClawdPetPlugin(BasePlugin):
                 self._is_singing = False
                 if self._current_lyric_idx != -2:
                     self._current_lyric_idx = -2
-                    if t_next - t_karaoke > 2.5:
-                        self._hide_bubble()
+                    self._hide_bubble()
 
         self._reschedule_karaoke_switch()
 
@@ -3625,9 +3686,18 @@ class ClawdPetPlugin(BasePlugin):
                     new_offset = t_line - t_calc_raw
                     self._user_offset = new_offset
 
-                    # Сохраняем в память сессии
-                    if self._current_track_id:
-                        self._session_offsets[self._current_track_id] = new_offset
+                    # 1.4 Сохраняем в память сессии по нормализованному ключу f"{clean_a} - {clean_t}"
+                    clean_a = getattr(self, "_last_active_clean_a", "")
+                    clean_t = getattr(self, "_last_active_clean_t", "")
+                    if not clean_t and self._current_track_id:
+                        parts = self._current_track_id.split("::")
+                        if len(parts) >= 3:
+                            clean_a, clean_t = parts[1], parts[2]
+                        elif len(parts) == 2:
+                            clean_t = parts[1]
+                    canon_key = f"{clean_a} - {clean_t}".strip(" -")
+                    if canon_key:
+                        self._session_offsets[canon_key] = new_offset
 
                     CLOG.log_info(
                         "SYNC",
