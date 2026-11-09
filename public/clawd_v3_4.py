@@ -951,6 +951,8 @@ class ClawdPetPlugin(BasePlugin):
         self._test_karaoke_active = False
         self._lyrics_retry_count = 0
         self._last_lyrics_retry = 0.0
+        self._last_failsafe_check = 0.0
+        self._dp_cache: Dict[Any, float] = {}
 
         # Синхронизация и джиттер
         self._track_base_pos = 0.0
@@ -1713,7 +1715,7 @@ class ClawdPetPlugin(BasePlugin):
         bubble_layout = LinearLayout(context)
         bubble_layout.setOrientation(LinearLayout.VERTICAL)
         bubble_layout.setGravity(Gravity.CENTER_HORIZONTAL)
-        bubble_layout.setMinimumWidth(AndroidUtilities.dp(220))
+        bubble_layout.setMinimumWidth(0)
         bubble_layout.setPadding(
             AndroidUtilities.dp(12), AndroidUtilities.dp(7),
             AndroidUtilities.dp(12), AndroidUtilities.dp(7),
@@ -1814,6 +1816,7 @@ class ClawdPetPlugin(BasePlugin):
 
     def _rebuild_sprites(self):
         old_w, old_h = self._w, self._h
+        self._dp_cache.clear()
         self._frames = {}
         self._particle_bitmaps = {}
         self._frame_key = None
@@ -1876,14 +1879,15 @@ class ClawdPetPlugin(BasePlugin):
         eyes, look, arms, legs, squash, blush, mouth, hat, fat_stage, color_signature = key
         _, body_color, eye_color = self._palette()
         blush_color = mix_color(body_color, 0xFFFF4F79, 0.5)
-        s = self._unit
-        bmp = Bitmap.createBitmap(GRID_W * s, GRID_H * s, Bitmap.Config.ARGB_8888)
-        canvas = Canvas(bmp)
-        paint = Paint()
+        # 4.1 Пакетная заливка пикселей спрайта без JNI-перегрузки (18x13 = 234 элемента)
+        pixel_array = [0] * (GRID_W * GRID_H)
 
         def px(x0, y0, x1, y1, color):
-            paint.setColor(jint(as_java_color(color)))
-            canvas.drawRect(float(x0 * s), float(y0 * s), float(x1 * s), float(y1 * s), paint)
+            c = as_java_color(color)
+            for y in range(max(0, y0), min(GRID_H, y1)):
+                row_start = y * GRID_W
+                for x in range(max(0, x0), min(GRID_W, x1)):
+                    pixel_array[row_start + x] = c
 
         # 4 стадии полноты «Обжоры»: 0: normal, 1: chubby, 2: fat, 3: balloon
         width_pad = [0, 1, 2, 3][fat_stage]
@@ -2018,7 +2022,7 @@ class ClawdPetPlugin(BasePlugin):
             px(left + 4, top - 4, right - 4, top - 1, 0xFF7B1FA2)
             px((left + right) // 2, top - 5, (left + right) // 2 + 1, top - 4, 0xFFFFD700)
 
-        return bmp
+        return Bitmap.createBitmap(jarray(jint)(pixel_array), GRID_W, GRID_H, Bitmap.Config.ARGB_8888)
 
     def _particle_bitmap(self, kind, is_gold=False):
         cache_key = f"{kind}_gold" if is_gold else kind
@@ -2192,7 +2196,12 @@ class ClawdPetPlugin(BasePlugin):
         return 110
 
     def _dp(self, value):
-        return float(AndroidUtilities.dp(value))
+        # 4.2 Мемоизация и кэширование AndroidUtilities.dp()
+        v = self._dp_cache.get(value)
+        if v is None:
+            v = float(AndroidUtilities.dp(value))
+            self._dp_cache[value] = v
+        return v
 
     def _bounds(self, now):
         if self._bounds_cache is not None and now - self._bounds_time < 0.4:
@@ -2212,7 +2221,10 @@ class ClawdPetPlugin(BasePlugin):
         try:
             display = decor.getDisplay()
             if display is not None:
-                self._rotation = int(display.getRotation())
+                new_rot = int(display.getRotation())
+                if new_rot != self._rotation:
+                    self._rotation = new_rot
+                    self._dp_cache.clear()
         except Exception:
             pass
         self._bounds_cache = (
@@ -2245,6 +2257,20 @@ class ClawdPetPlugin(BasePlugin):
         if self._pos_ready:
             self._poll_media(now)
             self._poll_clipboard(now)
+            # 1.3 Отказоустойчивый чекер строк (Fail-Safe Checker раз в 100 мс)
+            if (self._media == "music" or self._test_karaoke_active) and self._track_is_playing and self._lyrics_timeline:
+                if now - getattr(self, "_last_failsafe_check", 0.0) >= 0.10:
+                    self._last_failsafe_check = now
+                    t_calc_raw = self._get_current_track_pos(now)
+                    t_karaoke = t_calc_raw + self._user_offset
+                    expected_idx = -1
+                    for idx_item, (t_sec, _) in enumerate(self._lyrics_timeline):
+                        if t_sec <= t_karaoke:
+                            expected_idx = idx_item
+                        else:
+                            break
+                    if expected_idx >= 0 and expected_idx != self._current_lyric_idx:
+                        self._do_karaoke_line_switch()
         if self._decor.getWidth() <= 0:
             return
 
@@ -2630,9 +2656,16 @@ class ClawdPetPlugin(BasePlugin):
             return None
 
     def _scan_platforms(self, min_y, max_y):
+        if not self._cfg.get("gravity", False):
+            return []
         now = time.monotonic()
-        # 4.4 Кэширование: обход дерева не чаще раза в 350-400 мс
-        if self._platforms_cache and (now - self._last_platforms_scan_time < 0.38):
+        # 4.3 Время жизни кэша платформ _platforms_cache: 500 мс
+        if self._platforms_cache and (now - self._last_platforms_scan_time < 0.50):
+            return self._platforms_cache
+
+        # В состоянии покоя (idle) и сна (sleep) повторный обход дерева замораживается
+        is_moving = self._state in ("fly", "walk") or abs(self._vy) > 0.05 or self._hop_active
+        if not is_moving and self._platforms_cache:
             return self._platforms_cache
 
         t_scan_start = time.monotonic()
@@ -3556,7 +3589,11 @@ class ClawdPetPlugin(BasePlugin):
         # 2.2 Математика синхронизации и сдвига
         self._position_known = position_known
         if kind == "music":
-            t_new = track_position_ms / 1000.0
+            # 1.2 Компенсация задержки передачи моста: Δ_comp = 0.22 с
+            if not tg_playing:
+                t_new = (track_position_ms / 1000.0) + 0.22
+            else:
+                t_new = track_position_ms / 1000.0
             t_calc = self._get_current_track_pos(now)
             drift = abs(t_new - t_calc)
 
@@ -3573,11 +3610,11 @@ class ClawdPetPlugin(BasePlugin):
                     self._handler.removeCallbacks(self._karaoke_switch_r)
             else:
                 self._track_is_playing = True
-                # База обязана принудительно обновляться в трёх случаях:
-                # 1) Дрейф превысил порог: drift > 0.25;
-                # 2) Первый запуск трека: _track_base_time == 0.0;
-                # 3) Снятие с паузы: resumed == True.
-                if drift > 0.25 or self._track_base_time == 0.0 or resumed:
+                # База времени пересчитывается строго при:
+                # 1) Реальной ручной перемотке трека пользователем: drift > 1.2;
+                # 2) Первичном старте трека: _track_base_time == 0.0;
+                # 3) Возобновлении воспроизведения после паузы: resumed == True.
+                if drift > 1.2 or self._track_base_time == 0.0 or resumed:
                     CLOG.log_debug(
                         "JITTER",
                         f"Обновление базы: drift={drift*1000:.0f}мс resumed={resumed}",
@@ -3691,7 +3728,7 @@ class ClawdPetPlugin(BasePlugin):
         if self._state not in ("idle", "walk"):
             self._is_singing = False
             if self._handler and self._karaoke_switch_r:
-                self._handler.postDelayed(self._karaoke_switch_r, 120)
+                self._handler.postDelayed(self._karaoke_switch_r, 100)
             return
 
         # 2.2 Если position_known == False
@@ -3741,7 +3778,7 @@ class ClawdPetPlugin(BasePlugin):
     def _animate_text_change(self, view: TextView, new_text: str, target_alpha: float = 1.0):
         if view is None:
             return
-        shift_dp = float(AndroidUtilities.dp(6))
+        shift_dp = float(AndroidUtilities.dp(5))
         old_text = ""
         try:
             val = view.getText()
@@ -3785,6 +3822,23 @@ class ClawdPetPlugin(BasePlugin):
             bg.setColor(as_java_color(0xEE1A1A1E))
             bg.setStroke(max(1, AndroidUtilities.dp(1)), as_java_color(0x33FFFFFF))
             self._bubble.setBackground(bg)
+
+            # 2.2 Стабилизация караоке-виджета: фиксированная геометрия 210-260 dp
+            self._bubble.setMinimumWidth(AndroidUtilities.dp(210))
+            self._bubble.setPadding(
+                AndroidUtilities.dp(12), AndroidUtilities.dp(7),
+                AndroidUtilities.dp(12), AndroidUtilities.dp(7),
+            )
+            if self._bubble_text is not None:
+                self._bubble_text.setMinimumWidth(AndroidUtilities.dp(210))
+                self._bubble_text.setMaxWidth(AndroidUtilities.dp(260))
+                self._bubble_text.setGravity(Gravity.CENTER_HORIZONTAL)
+                self._bubble_text.setLayoutParams(LinearLayout.LayoutParams(-1, -2))
+            if self._bubble_subtext is not None:
+                self._bubble_subtext.setMinimumWidth(AndroidUtilities.dp(210))
+                self._bubble_subtext.setMaxWidth(AndroidUtilities.dp(260))
+                self._bubble_subtext.setGravity(Gravity.CENTER_HORIZONTAL)
+                self._bubble_subtext.setLayoutParams(LinearLayout.LayoutParams(-1, -2))
 
             self._bubble_text.setTextColor(as_java_color(0xFFFFFFFF))
             self._animate_text_change(self._bubble_text, current_text, target_alpha=1.0)
@@ -3920,7 +3974,18 @@ class ClawdPetPlugin(BasePlugin):
             bg.setStroke(max(1, AndroidUtilities.dp(1)), Theme.getColor(Theme.key_divider))
             self._bubble.setBackground(bg)
 
+            # 2.1 Изоляция стилей обычной речи: компактное облачко WRAP_CONTENT с паддингами 10 dp
+            self._bubble.setMinimumWidth(0)
+            self._bubble.setLayoutParams(FrameLayout.LayoutParams(-2, -2))
+            pad10 = AndroidUtilities.dp(10)
+            pad6 = AndroidUtilities.dp(6)
+            self._bubble.setPadding(pad10, pad6, pad10, pad6)
+
             if self._bubble_text is not None:
+                self._bubble_text.setMinimumWidth(0)
+                self._bubble_text.setMaxWidth(AndroidUtilities.dp(200))
+                self._bubble_text.setGravity(Gravity.NO_GRAVITY)
+                self._bubble_text.setLayoutParams(LinearLayout.LayoutParams(-2, -2))
                 self._bubble_text.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlackText))
                 self._bubble_text.setText(text)
             if self._bubble_subtext is not None:

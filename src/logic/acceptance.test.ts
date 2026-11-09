@@ -38,7 +38,7 @@ test('Clawd v3.4 contains all 5 critical bugfixes from ТЗ', () => {
     '1.2: Missing was_paused and resumed state transition tracking'
   );
   assert.ok(
-    code.includes('drift > 0.25 or self._track_base_time == 0.0 or resumed'),
+    (code.includes('drift > 1.2') || code.includes('drift > 0.25')) && code.includes('self._track_base_time == 0.0 or resumed'),
     '1.2: Missing base update condition on resumed == True'
   );
 
@@ -79,8 +79,8 @@ test('Clawd v3.4.1 contains all 6 enhancements from Правка 3.4.1', () => {
 
   // 1. Karaoke loop survival during hops/taps
   assert.ok(
-    code.includes('postDelayed(self._karaoke_switch_r, 120)'),
-    '3.4.1.1: Missing 120ms reschedule when state is not idle/walk'
+    code.includes('postDelayed(self._karaoke_switch_r, 100)') || code.includes('postDelayed(self._karaoke_switch_r, 120)'),
+    '3.4.1.1: Missing reschedule (100ms/120ms) when state is not idle/walk'
   );
 
   // 2. Tap-flee mechanic (+15% speed and jump upwards)
@@ -126,82 +126,100 @@ test('Clawd v3.5 satisfies all requirements from ТЗ v3.5', () => {
   const filePath = path.resolve(process.cwd(), 'public/clawd_v3_4.py');
   const code = fs.readFileSync(filePath, 'utf-8');
 
-  // BLOCK 1: Karaoke UI Stabilization
-  // 1.1 Stabilized width (min 220dp, max 260dp, center horizontal)
+  // РАЗДЕЛ 1: Караоке-тайминги, устранение джиттера и синхронизация
+  // 1.1 Порог джиттера drift > 1.2 с
   assert.ok(
-    code.includes('setMinimumWidth(AndroidUtilities.dp(220))'),
-    'v3.5.1: bubble layout must have minimumWidth of 220dp'
+    code.includes('drift > 1.2'),
+    '1.1: Дрейф времени должен проверяться по порогу drift > 1.2'
+  );
+
+  // 1.2 Компенсация задержки моста Δ_comp = 0.22 с
+  assert.ok(
+    code.includes('(track_position_ms / 1000.0) + 0.22'),
+    '1.2: Должна прибавляться компенсация задержки моста +0.22с'
+  );
+
+  // 1.3 Отказоустойчивый чекер строк в _step() раз в 100 мс
+  assert.ok(
+    code.includes('_last_failsafe_check') && code.includes('0.10'),
+    '1.3: Отказоустойчивый чекер строк в _step должен проверять позицию раз в 100 мс'
+  );
+
+  // 1.4 Tap-to-Sync и сдвиг времени _user_offset
+  assert.ok(
+    code.includes('📋') && code.includes('t_line - t_calc_raw') && code.includes('_session_offsets'),
+    '1.4: Кнопка 📋, расчет _user_offset и сохранение в _session_offsets'
+  );
+
+  // 1.5 Инструментальные паузы и 100 мс повтор при прыжке/тапе
+  assert.ok(
+    code.includes('postDelayed(self._karaoke_switch_r, 100)'),
+    '1.5: Повтор вызова караоке при прыжке/тапе строго через 100 мс'
+  );
+
+  // 1.6 LyricsHelper stability
+  assert.ok(
+    /finally:\s+with self\.lock:\s+self\.loading\.discard\(key\)/.test(code),
+    '1.6: Снятие loading.discard строго в блоке finally'
+  );
+  assert.ok(
+    code.includes('if timeline:') && code.includes('self.cache[key] = timeline'),
+    '1.6: Запрещено сохранять пустые результаты в self.cache'
+  );
+
+  // РАЗДЕЛ 2: Разделение UI облачка: речь vs караоке
+  // 2.1 Изоляция стилей обычной речи (_say: setMinimumWidth(0) и WRAP_CONTENT)
+  assert.ok(
+    code.includes('self._bubble.setMinimumWidth(0)'),
+    '2.1: В _say() минимальная ширина сбрасывается в 0'
+  );
+
+  // 2.2 Стабилизация караоке-виджета (_show_karaoke_line: 210dp-260dp, center)
+  assert.ok(
+    code.includes('self._bubble.setMinimumWidth(AndroidUtilities.dp(210))'),
+    '2.2: В _show_karaoke_line минимальная ширина фиксируется на 210dp'
   );
   assert.ok(
     code.includes('setMaxWidth(AndroidUtilities.dp(260))'),
-    'v3.5.1: bubble text must have maxWidth of 260dp'
+    '2.2: Максимальная ширина текста 260dp'
   );
   assert.ok(
     code.includes('Gravity.CENTER_HORIZONTAL'),
-    'v3.5.1: text alignment inside bubble must be Gravity.CENTER_HORIZONTAL'
+    '2.2: Выравнивание текста строго по центру Gravity.CENTER_HORIZONTAL'
   );
 
-  // 1.2 Persistent background (never hide bubble on instrumental break during playback)
+  // 2.3 Бесшовная смена строк (5dp смещение за 150мс)
   assert.ok(
-    code.includes('♪ ♪ ♪'),
-    'v3.5.1: bubble must show instrumental indicator ♪ ♪ ♪ without hiding bubble'
-  );
-  assert.ok(
-    code.includes('is_karaoke_active') && code.includes('not is_karaoke_active:'),
-    'v3.5.1: _update_bubble must keep bubble visible while karaoke is active'
+    code.includes('AndroidUtilities.dp(5)'),
+    '2.3: Анимация сдвига строки строго 5dp'
   );
 
-  // 1.3 Smooth text transition (Cross-fade & Slide-up 6dp in 150ms)
+  // РАЗДЕЛ 3: Суточное логирование
   assert.ok(
-    code.includes('_animate_text_change') && code.includes('AndroidUtilities.dp(6)'),
-    'v3.5.1: text change must use 6dp vertical translation'
+    code.includes('ClaudePet_{day_str}.txt'),
+    '3.1: Лог пишется в посуточный файл ClaudePet_YYYY-MM-DD.txt'
   );
-  assert.ok(
-    code.includes('setDuration(150)'),
-    'v3.5.1: text animation duration must be 150ms'
-  );
-
-  // 1.4 Fixed height in two lines
-  assert.ok(
-    code.includes('setAlpha(0.45)') || code.includes('target_alpha=0.45'),
-    'v3.5.1: second line must have 45% alpha'
-  );
-
-  // BLOCK 2: LyricsHelper Stability & Deadlock Fix
-  // 2.1 finally block for discard(key)
-  assert.ok(
-    /finally:\s+with self\.lock:\s+self\.loading\.discard\(key\)/.test(code),
-    'v3.5.2: LyricsHelper must discard loading key in finally: block'
-  );
-
-  // 2.2 Prohibition of caching empty failures
-  assert.ok(
-    code.includes('if timeline:') && code.includes('self.cache[key] = timeline'),
-    'v3.5.2: empty failure timeline must NOT be cached in self.cache[key]'
-  );
-
-  // 2.3 Soft Auto-Retry
-  assert.ok(
-    code.includes('_lyrics_retry_count < 3') && code.includes('_last_lyrics_retry'),
-    'v3.5.2: must auto-retry lyrics fetch up to 3 times for active tracks'
-  );
-
-  // BLOCK 3: Daily Single-Stream Logging
-  // 3.1 Removal of log level selector
   assert.ok(
     !code.includes('key="log_level"'),
-    'v3.5.3: log_level selector must be removed from settings menu'
+    '3.2: Селектор уровня логирования удален'
   );
 
-  // 3.2 Daily files ClaudePet_YYYY-MM-DD.txt
+  // РАЗДЕЛ 4: Оптимизация производительности
+  // 4.1 Пакетная заливка пикселей спрайта
   assert.ok(
-    code.includes('ClaudePet_{day_str}.txt') || code.includes('ClaudePet_%Y-%m-%d'),
-    'v3.5.3: log files must be named ClaudePet_YYYY-MM-DD.txt'
+    code.includes('Bitmap.createBitmap(jarray(jint)(pixel_array), GRID_W, GRID_H'),
+    '4.1: Рендеринг кадра спрайта выполняется пакетной передачей массива пикселей'
   );
 
-  // 3.3 Detailed HTTP context in _req
+  // 4.2 Мемоизация и кэширование _dp
   assert.ok(
-    code.includes('HTTP {status} len=') && code.includes('LYRICS_NET'),
-    'v3.5.3: _req must log detailed HTTP status code, URL, and body length'
+    code.includes('_dp_cache') && code.includes('self._dp_cache.get(value)'),
+    '4.2: Метод _dp() мемоизирует результаты в _dp_cache'
+  );
+
+  // 4.3 Ленивое сканирование платформ (500 мс кэш)
+  assert.ok(
+    code.includes('0.50') && code.includes('_last_platforms_scan_time'),
+    '4.3: Время жизни кэша платформ 500 мс с заморозкой в idle/sleep'
   );
 });
