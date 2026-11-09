@@ -43,15 +43,15 @@ export function lintClawdPluginCode(code: string): LintReport {
     severity: 'critical',
   });
 
-  // 2. Version 3.4 Invariant
-  const hasV34 = /__version__\s*=\s*["']3\.4["']/.test(code);
+  // 2. Version Invariant (3.4 or 3.5)
+  const hasVersion = /__version__\s*=\s*["'](3\.4|3\.5)["']/.test(code);
   rules.push({
-    id: 'version_3_4',
-    title: 'Версия плагина Clawd v3.4',
-    passed: hasV34,
-    details: hasV34
-      ? '__version__ = "3.4" установлен.'
-      : 'Требуется установить __version__ = "3.4"',
+    id: 'version_valid',
+    title: 'Версия плагина Clawd v3.4 / v3.5',
+    passed: hasVersion,
+    details: hasVersion
+      ? 'Версия плагина валидна (__version__ 3.4/3.5).'
+      : 'Требуется установить __version__ = "3.4" или "3.5"',
     severity: 'critical',
   });
 

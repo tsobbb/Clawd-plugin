@@ -730,6 +730,30 @@ export default function App() {
                   badge: '3.4.1: No Leak',
                 },
                 {
+                  id: 'v35-block-1',
+                  title: 'ТЗ v3.5 Блок 1: Стабилизация UI караоке (220-260dp, Slide-up 6dp 150ms, 2 строки)',
+                  status: 'PASS',
+                  details:
+                    'Фиксированная ширина minimumWidth=220dp, maxWidth=260dp, Gravity.CENTER_HORIZONTAL. Анимация Cross-fade / Slide-up 6dp за 150мс. Две строки (текущая 100% white bold, следующая 45% alpha). Непрерывный фон без миганий (♪ ♪ ♪ на проигрышах).',
+                  badge: 'v3.5: Smooth Bubble',
+                },
+                {
+                  id: 'v35-block-2',
+                  title: 'ТЗ v3.5 Блок 2: Исправление зависания поиска слов (finally, без кэша неудач, Auto-Retry)',
+                  status: 'PASS',
+                  details:
+                    'Гарантированный self.loading.discard(key) строго в блоке finally: исключает deadlock. Пустые результаты не кэшируются. Soft Auto-Retry каждые 6 сек до 3 раз при играющем треке.',
+                  badge: 'v3.5: No Deadlock',
+                },
+                {
+                  id: 'v35-block-3',
+                  title: 'ТЗ v3.5 Блок 3: Единый суточный лог (ClaudePet_YYYY-MM-DD.txt, детальный HTTP)',
+                  status: 'PASS',
+                  details:
+                    'Все события пишутся в единый суточный файл ClaudePet_YYYY-MM-DD.txt с сохранением истории прошлых дней. Селектор уровней удален из настроек. В _req логируются точный URL, HTTP статус, длина и ошибки.',
+                  badge: 'v3.5: Daily Logs',
+                },
+                {
                   id: '3',
                   title: '3. Математика синхронизации и сдвига (T_calc + _user_offset, Jitter > 0.25c)',
                   status: 'PASS',

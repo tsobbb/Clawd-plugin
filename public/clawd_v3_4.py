@@ -6,9 +6,11 @@ import os
 import queue
 import random
 import re
+import socket
 import threading
 import time
 import traceback
+import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Any, Dict, List, Optional, Tuple
@@ -45,15 +47,16 @@ WeakReference = jclass("java.lang.ref.WeakReference")
 __id__ = "clawd_pet"
 __name__ = "Clawd"
 __description__ = (
-    "Ультимативный интерактивный питомец для Telegram v3.4.\n\n"
-    "• Синхронное караоке (LRCLIB + NetEase) и SoundCloud oEmbed.\n"
+    "Ультимативный интерактивный питомец для Telegram v3.5.\n\n"
+    "• Стабилизированное двухстрочное караоке со сглаживанием текста и защитой от скачков.\n"
+    "• Автоповтор поиска слов, защита от deadlock и сохранение архивов.\n"
+    "• Единое суточное логирование ClaudePet_YYYY-MM-DD.txt без потерь.\n"
     "• Бесшовная интеграция с Clawd Bridge и Tap-to-Sync [📋].\n"
     "• Режим «Абсолютный Обжора» 2.0: безопасное поедание любого View с WeakReference.\n"
-    "• Глубокая логика Telegram: разделяет свои заметки и входящие сообщения.\n"
-    "• Лазерная указка двумя пальцами, гравитация на всех экранах и 11 шапок."
+    "• Глубокая логика Telegram: разделяет свои заметки и входящие сообщения."
 )
 __author__ = "@tsobbb"
-__version__ = "3.4"
+__version__ = "3.5"
 __icon__ = "clawd_poop_5050_1783593604/0"
 
 GRID_W = 18
@@ -339,7 +342,7 @@ class ClaudeLogger:
         self.errors_dir = None
         self.lyrics_dir = None
         self.ring_buffer = collections.deque(maxlen=500)
-        self.min_level_str = "INFO"
+        self.min_level_str = "DEBUG"
         self._write_queue = queue.Queue()
         self._stop_event = threading.Event()
         self._writer_thread = None
@@ -392,21 +395,21 @@ class ClaudeLogger:
     def _flush_batch(self, batch: List[Tuple[str, str, str]]):
         if not self.logs_dir:
             return
-        runtime_fp = os.path.join(self.logs_dir, "ClaudePet_Runtime.txt")
+        day_str = datetime.datetime.now().strftime("%Y-%m-%d")
+        daily_fp = os.path.join(self.logs_dir, f"ClaudePet_{day_str}.txt")
         errors_fp = os.path.join(self.errors_dir, "ClaudePet_Errors.txt")
 
         try:
-            runtime_lines = []
+            daily_lines = []
             error_lines = []
             for level, tag, line in batch:
-                runtime_lines.append(line + "\n")
+                daily_lines.append(line + "\n")
                 if level == "ERROR":
                     error_lines.append(line + "\n")
 
-            if runtime_lines:
-                self._rotate_if_needed(runtime_fp, is_runtime=True)
-                with open(runtime_fp, "a", encoding="utf-8") as f:
-                    f.writelines(runtime_lines)
+            if daily_lines:
+                with open(daily_fp, "a", encoding="utf-8") as f:
+                    f.writelines(daily_lines)
 
             if error_lines:
                 self._rotate_if_needed(errors_fp, is_runtime=False)
@@ -423,13 +426,7 @@ class ClaudeLogger:
             if size < MAX_LOG_FILE_SIZE:
                 return
             if is_runtime:
-                rot_fp = os.path.join(self.logs_dir, "ClaudePet_Runtime.1.txt")
-                if os.path.exists(rot_fp):
-                    try:
-                        os.remove(rot_fp)
-                    except Exception:
-                        pass
-                os.rename(fp, rot_fp)
+                pass
             else:
                 # ClaudePet_Errors.txt: усекается с сохранением последних 200 строк
                 with open(fp, "r", encoding="utf-8") as f:
@@ -450,9 +447,6 @@ class ClaudeLogger:
             self._writer_thread.join(timeout=1.0)
 
     def log(self, level: str, tag: str, message: str, key_values: Optional[Dict[str, Any]] = None):
-        lvl_val = LEVEL_VALUES.get(level, 20)
-        min_val = LEVEL_VALUES.get(self.min_level_str, 20)
-
         # Формат: ГГГГ-ММ-ДД ЧЧ:ММ:СС.mmm | LEVEL | TAG | сообщение | key=value
         ts_now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
         kv_str = ""
@@ -464,11 +458,11 @@ class ClaudeLogger:
         self.ring_buffer.append(line)
         log(f"[{tag}] {message}")
 
-        if lvl_val >= min_val:
-            try:
-                self._write_queue.put_nowait((level, tag, line))
-            except Exception:
-                pass
+        # Единый поток: пишем все уровни в очередь суточного лога
+        try:
+            self._write_queue.put_nowait((level, tag, line))
+        except Exception:
+            pass
 
     def log_debug(self, tag: str, message: str, **kwargs):
         self.log("DEBUG", tag, message, kwargs if kwargs else None)
@@ -730,13 +724,27 @@ class LyricsHelper:
     def _req(self, url: str) -> Optional[dict]:
         try:
             req = urllib.request.Request(
-                url, headers={"User-Agent": "Mozilla/5.0 (Android; ClawdKaraoke/3.4)"}
+                url, headers={"User-Agent": "Mozilla/5.0 (Android; ClawdKaraoke/3.5)"}
             )
             with urllib.request.urlopen(req, timeout=3.5) as resp:
-                if resp.status == 200:
-                    return json.loads(resp.read().decode("utf-8"))
-        except Exception:
-            pass
+                status = getattr(resp, "status", 200)
+                body = resp.read()
+                length = len(body)
+                CLOG.log_debug("LYRICS_NET", f"HTTP {status} len={length} url={url}", status=status, len=length, url=url)
+                if status == 200:
+                    try:
+                        return json.loads(body.decode("utf-8"))
+                    except Exception as pe:
+                        CLOG.log_warn("LYRICS_NET", f"JSON parse error: {pe} url={url}")
+                        return None
+        except urllib.error.HTTPError as he:
+            CLOG.log_warn("LYRICS_NET", f"HTTP {he.code} {he.reason} url={url}", status=he.code, url=url)
+        except urllib.error.URLError as ue:
+            CLOG.log_warn("LYRICS_NET", f"Network URLError: {ue.reason} url={url}", url=url)
+        except socket.timeout:
+            CLOG.log_warn("LYRICS_NET", f"Timeout 3.5s url={url}", status="Timeout", url=url)
+        except Exception as e:
+            CLOG.log_warn("LYRICS_NET", f"Request failed: {e} url={url}", url=url)
         return None
 
     def resolve_soundcloud_url(self, sc_url: str) -> Optional[Tuple[str, str]]:
@@ -800,27 +808,34 @@ class LyricsHelper:
             self.loading.add(key)
 
         def _worker():
-            # 1. Проверяем локальный архив на диске
-            cached_text = CLOG.check_lyrics_archive(clean_a, clean_t)
-            source_tag = "ARCHIVE"
-            lrc = cached_text
+            try:
+                # 1. Проверяем локальный архив на диске
+                cached_text = CLOG.check_lyrics_archive(clean_a, clean_t)
+                source_tag = "ARCHIVE"
+                lrc = cached_text
 
-            if not lrc:
-                self._log(f"Поиск слов в сети: '{clean_a}' — '{clean_t}'")
-                lrc = self.fetch_lrclib(clean_a, clean_t)
-                source_tag = "LRCLIB"
                 if not lrc:
-                    lrc = self.fetch_netease(clean_a, clean_t)
-                    source_tag = "NETEASE"
-                if lrc:
-                    CLOG.save_lyrics_archive(clean_a, clean_t, lrc)
+                    self._log(f"Поиск слов в сети: '{clean_a}' — '{clean_t}'")
+                    lrc = self.fetch_lrclib(clean_a, clean_t)
+                    source_tag = "LRCLIB"
+                    if not lrc:
+                        lrc = self.fetch_netease(clean_a, clean_t)
+                        source_tag = "NETEASE"
+                    if lrc:
+                        CLOG.save_lyrics_archive(clean_a, clean_t, lrc)
 
-            timeline = self.parse_lrc(lrc) if lrc else []
-            with self.lock:
-                self.cache[key] = timeline
-                self.loading.discard(key)
-            self._log(f"Загружено строк ({source_tag}) для '{clean_t}': {len(timeline)}")
-            callback(timeline)
+                timeline = self.parse_lrc(lrc) if lrc else []
+                with self.lock:
+                    if timeline:
+                        self.cache[key] = timeline
+                self._log(f"Загружено строк ({source_tag}) для '{clean_t}': {len(timeline)}")
+                callback(timeline)
+            except Exception as e:
+                CLOG.log_error("LYRICS", f"Ошибка получения слов для '{clean_t}'", e)
+                callback([])
+            finally:
+                with self.lock:
+                    self.loading.discard(key)
 
         threading.Thread(target=_worker, daemon=True, name="lyrics_fetcher").start()
 
@@ -934,6 +949,8 @@ class ClawdPetPlugin(BasePlugin):
         self._current_lyric_idx = -1
         self._is_singing = False
         self._test_karaoke_active = False
+        self._lyrics_retry_count = 0
+        self._last_lyrics_retry = 0.0
 
         # Синхронизация и джиттер
         self._track_base_pos = 0.0
@@ -1312,14 +1329,6 @@ class ClawdPetPlugin(BasePlugin):
                 icon="msg_photo_rotate",
                 on_change=lambda v: self._on_cfg_change("shake", v),
             ),
-            Selector(
-                key="log_level",
-                text="Уровень логирования",
-                default=1,
-                items=LOG_LEVELS,
-                icon="msg_log",
-                on_change=lambda v: self._on_cfg_change("log_level", v),
-            ),
             Header(text="🧪 Тестирование и Отладка"),
             Text(
                 text="🧪 Тестовый полигон (12 тестов)",
@@ -1329,7 +1338,7 @@ class ClawdPetPlugin(BasePlugin):
                 on_click=lambda _v=None: run_on_ui_thread(self._open_test_sandbox),
             ),
             Text(
-                text="Открыть логи (Downloads/ClaudePet/*.txt)",
+                text="Открыть суточный лог (Downloads/ClaudePet/Logs/*.txt)",
                 subtext=f"Записей в буфере: {len(CLOG.ring_buffer)}",
                 icon="msg_log",
                 on_click=lambda _v=None: run_on_ui_thread(self._show_logs_dialog),
@@ -1557,9 +1566,6 @@ class ClawdPetPlugin(BasePlugin):
             CLOG.log_error("MEDIA_KEY", "Key dispatch error", e)
 
     def _reload_cfg(self):
-        log_lvl_idx = clamp(int(self.get_setting("log_level", 1) or 0), 0, len(LOG_LEVELS) - 1)
-        CLOG.min_level_str = LOG_LEVELS[log_lvl_idx]
-
         self._cfg = {
             "show": bool(self.get_setting("show", True)),
             "size": int(self.get_setting("size", 1) or 0),
@@ -1581,7 +1587,6 @@ class ClawdPetPlugin(BasePlugin):
             "sc_autostart_incoming": bool(self.get_setting("sc_autostart_incoming", False)),
             "poop": bool(self.get_setting("poop", True)),
             "shake": bool(self.get_setting("shake", True)),
-            "log_level": log_lvl_idx,
         }
 
     def _on_cfg_change(self, key, value):
@@ -1596,9 +1601,6 @@ class ClawdPetPlugin(BasePlugin):
             run_on_ui_thread(self._remove_poops)
         elif key == "shake":
             run_on_ui_thread(self._start_sensor if value else self._stop_sensor)
-        elif key == "log_level":
-            idx = clamp(int(value), 0, len(LOG_LEVELS) - 1)
-            CLOG.min_level_str = LOG_LEVELS[idx]
 
     def _on_menu_toggle(self, context=None):
         show = not self._cfg.get("show", True)
@@ -1710,6 +1712,8 @@ class ClawdPetPlugin(BasePlugin):
 
         bubble_layout = LinearLayout(context)
         bubble_layout.setOrientation(LinearLayout.VERTICAL)
+        bubble_layout.setGravity(Gravity.CENTER_HORIZONTAL)
+        bubble_layout.setMinimumWidth(AndroidUtilities.dp(220))
         bubble_layout.setPadding(
             AndroidUtilities.dp(12), AndroidUtilities.dp(7),
             AndroidUtilities.dp(12), AndroidUtilities.dp(7),
@@ -1718,19 +1722,23 @@ class ClawdPetPlugin(BasePlugin):
 
         bubble_text = TextView(context)
         bubble_text.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 13.0)
-        bubble_text.setMaxWidth(AndroidUtilities.dp(250))
+        bubble_text.setMinimumWidth(AndroidUtilities.dp(220))
+        bubble_text.setMaxWidth(AndroidUtilities.dp(260))
+        bubble_text.setGravity(Gravity.CENTER_HORIZONTAL)
         try:
             bubble_text.setTypeface(AndroidUtilities.bold())
         except Exception:
             pass
-        bubble_layout.addView(bubble_text, LinearLayout.LayoutParams(-2, -2))
+        bubble_layout.addView(bubble_text, LinearLayout.LayoutParams(-1, -2))
 
         bubble_subtext = TextView(context)
         bubble_subtext.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 10.5)
-        bubble_subtext.setMaxWidth(AndroidUtilities.dp(250))
-        bubble_subtext.setAlpha(0.55)
-        bubble_subtext.setVisibility(View.GONE)
-        bubble_layout.addView(bubble_subtext, LinearLayout.LayoutParams(-2, -2))
+        bubble_subtext.setMinimumWidth(AndroidUtilities.dp(220))
+        bubble_subtext.setMaxWidth(AndroidUtilities.dp(260))
+        bubble_subtext.setGravity(Gravity.CENTER_HORIZONTAL)
+        bubble_subtext.setAlpha(0.45)
+        bubble_subtext.setVisibility(View.VISIBLE)
+        bubble_layout.addView(bubble_subtext, LinearLayout.LayoutParams(-1, -2))
 
         controls = LinearLayout(context)
         controls.setOrientation(LinearLayout.HORIZONTAL)
@@ -3489,6 +3497,8 @@ class ClawdPetPlugin(BasePlugin):
                 self._lyrics_timeline = []
                 self._current_lyric_idx = -1
                 self._is_singing = False
+                self._lyrics_retry_count = 0
+                self._last_lyrics_retry = 0.0
 
                 # Из памяти сессии извлекается сохранённый сдвиг _user_offset для данного трека
                 track_offset_key = f"{clean_a} - {clean_t}"
@@ -3519,6 +3529,29 @@ class ClawdPetPlugin(BasePlugin):
                         run_on_ui_thread(_apply)
 
                     self._lyrics_helper.get_lyrics_async(clean_a, clean_t, _on_lyrics_loaded)
+
+            # 2.2 Автоматический повтор (Soft Auto-Retry), если трек играет, но слова ещё не найдены
+            elif kind == "music" and is_playing and not self._lyrics_timeline and (clean_a or clean_t):
+                if self._lyrics_retry_count < 3 and (now - self._last_lyrics_retry >= 6.0):
+                    self._lyrics_retry_count += 1
+                    self._last_lyrics_retry = now
+                    CLOG.log_info(
+                        "LYRICS",
+                        f"Автоповтор поиска слов ({self._lyrics_retry_count}/3): '{clean_a}' — '{clean_t}'",
+                        retry=self._lyrics_retry_count,
+                        artist=clean_a,
+                        title=clean_t,
+                    )
+                    def _on_retry_loaded(tl):
+                        def _apply_retry():
+                            if tl:
+                                self._lyrics_timeline = tl
+                                self._reschedule_karaoke_switch()
+                            elif self._lyrics_retry_count >= 3:
+                                self._say("no_lyrics")
+                        run_on_ui_thread(_apply_retry)
+
+                    self._lyrics_helper.get_lyrics_async(clean_a, clean_t, _on_retry_loaded)
 
         # 2.2 Математика синхронизации и сдвига
         self._position_known = position_known
@@ -3693,11 +3726,55 @@ class ClawdPetPlugin(BasePlugin):
                     self._show_karaoke_line(cur_line, next_line, now)
             else:
                 self._is_singing = False
-                if self._current_lyric_idx != -2:
-                    self._current_lyric_idx = -2
-                    self._hide_bubble()
+                # Во время воспроизведения трека темная плашка караоке НЕ скрывается на микро-паузах или проигрышах
+                if self._track_is_playing and bool(self._lyrics_timeline):
+                    if self._current_lyric_idx != -2:
+                        self._current_lyric_idx = -2
+                        self._show_karaoke_line("♪ ♪ ♪", next_line, now)
+                else:
+                    if self._current_lyric_idx != -2:
+                        self._current_lyric_idx = -2
+                        self._hide_bubble()
 
         self._reschedule_karaoke_switch()
+
+    def _animate_text_change(self, view: TextView, new_text: str, target_alpha: float = 1.0):
+        if view is None:
+            return
+        shift_dp = float(AndroidUtilities.dp(6))
+        old_text = ""
+        try:
+            val = view.getText()
+            if val is not None:
+                old_text = str(val.toString() if hasattr(val, "toString") else val)
+        except Exception:
+            old_text = ""
+
+        if old_text == new_text and float(view.getAlpha()) > 0.05:
+            view.animate().alpha(target_alpha).translationY(0.0).setDuration(150).start()
+            return
+
+        if not old_text or not self._bubble_visible:
+            view.setText(new_text)
+            view.setTranslationY(0.0)
+            view.setAlpha(target_alpha)
+            return
+
+        try:
+            view.animate().cancel()
+            def _on_faded_out():
+                try:
+                    view.setText(new_text)
+                    view.setTranslationY(shift_dp)
+                    view.animate().translationY(0.0).alpha(target_alpha).setDuration(150).start()
+                except Exception:
+                    pass
+
+            view.animate().translationY(-shift_dp).alpha(0.0).setDuration(150).withEndAction(R(_on_faded_out)).start()
+        except Exception:
+            view.setText(new_text)
+            view.setTranslationY(0.0)
+            view.setAlpha(target_alpha)
 
     def _show_karaoke_line(self, current_text: str, next_text: str, now: float):
         if self._bubble is None or self._bubble_text is None:
@@ -3710,14 +3787,16 @@ class ClawdPetPlugin(BasePlugin):
             self._bubble.setBackground(bg)
 
             self._bubble_text.setTextColor(as_java_color(0xFFFFFFFF))
-            self._bubble_text.setText(current_text)
+            self._animate_text_change(self._bubble_text, current_text, target_alpha=1.0)
 
-            if next_text and self._bubble_subtext is not None:
-                self._bubble_subtext.setText(next_text)
-                self._bubble_subtext.setTextColor(0x77FFFFFF)
+            # Фиксированная высота в две строки: нижняя строка на 45% alpha или невидимая заглушка фиксированной высоты
+            if self._bubble_subtext is not None:
                 self._bubble_subtext.setVisibility(View.VISIBLE)
-            elif self._bubble_subtext is not None:
-                self._bubble_subtext.setVisibility(View.GONE)
+                if next_text:
+                    self._bubble_subtext.setTextColor(as_java_color(0x77FFFFFF))
+                    self._animate_text_change(self._bubble_subtext, next_text, target_alpha=0.45)
+                else:
+                    self._animate_text_change(self._bubble_subtext, " ", target_alpha=0.0)
 
             if self._media_controls_layout is not None and self._cfg.get("media_controls", True):
                 self._media_controls_layout.setVisibility(View.VISIBLE)
@@ -3798,6 +3877,8 @@ class ClawdPetPlugin(BasePlugin):
         self._track_is_playing = True
         self._track_base_pos = 0.0
         self._track_base_time = time.monotonic()
+        self._lyrics_retry_count = 0
+        self._last_lyrics_retry = 0.0
         self._user_offset = self._session_offsets.get(f"{a} - {t}", 0.0)
 
         self._say_track_detected(a, t)
@@ -3877,7 +3958,8 @@ class ClawdPetPlugin(BasePlugin):
     def _update_bubble(self, now, width, min_y):
         if self._bubble is None or not self._bubble_visible:
             return
-        if now >= self._bubble_until and not self._is_singing:
+        is_karaoke_active = (self._media == "music" or self._test_karaoke_active) and self._track_is_playing and bool(self._lyrics_timeline)
+        if now >= self._bubble_until and not self._is_singing and not is_karaoke_active:
             self._hide_bubble()
             return
         bw, bh = self._bubble.getWidth(), self._bubble.getHeight()

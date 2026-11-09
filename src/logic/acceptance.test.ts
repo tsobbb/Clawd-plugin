@@ -121,3 +121,87 @@ test('Clawd v3.4.1 contains all 6 enhancements from Правка 3.4.1', () => {
     '3.4.1.6: Missing already-attached listener check before adding to RecyclerView'
   );
 });
+
+test('Clawd v3.5 satisfies all requirements from ТЗ v3.5', () => {
+  const filePath = path.resolve(process.cwd(), 'public/clawd_v3_4.py');
+  const code = fs.readFileSync(filePath, 'utf-8');
+
+  // BLOCK 1: Karaoke UI Stabilization
+  // 1.1 Stabilized width (min 220dp, max 260dp, center horizontal)
+  assert.ok(
+    code.includes('setMinimumWidth(AndroidUtilities.dp(220))'),
+    'v3.5.1: bubble layout must have minimumWidth of 220dp'
+  );
+  assert.ok(
+    code.includes('setMaxWidth(AndroidUtilities.dp(260))'),
+    'v3.5.1: bubble text must have maxWidth of 260dp'
+  );
+  assert.ok(
+    code.includes('Gravity.CENTER_HORIZONTAL'),
+    'v3.5.1: text alignment inside bubble must be Gravity.CENTER_HORIZONTAL'
+  );
+
+  // 1.2 Persistent background (never hide bubble on instrumental break during playback)
+  assert.ok(
+    code.includes('♪ ♪ ♪'),
+    'v3.5.1: bubble must show instrumental indicator ♪ ♪ ♪ without hiding bubble'
+  );
+  assert.ok(
+    code.includes('is_karaoke_active') && code.includes('not is_karaoke_active:'),
+    'v3.5.1: _update_bubble must keep bubble visible while karaoke is active'
+  );
+
+  // 1.3 Smooth text transition (Cross-fade & Slide-up 6dp in 150ms)
+  assert.ok(
+    code.includes('_animate_text_change') && code.includes('AndroidUtilities.dp(6)'),
+    'v3.5.1: text change must use 6dp vertical translation'
+  );
+  assert.ok(
+    code.includes('setDuration(150)'),
+    'v3.5.1: text animation duration must be 150ms'
+  );
+
+  // 1.4 Fixed height in two lines
+  assert.ok(
+    code.includes('setAlpha(0.45)') || code.includes('target_alpha=0.45'),
+    'v3.5.1: second line must have 45% alpha'
+  );
+
+  // BLOCK 2: LyricsHelper Stability & Deadlock Fix
+  // 2.1 finally block for discard(key)
+  assert.ok(
+    /finally:\s+with self\.lock:\s+self\.loading\.discard\(key\)/.test(code),
+    'v3.5.2: LyricsHelper must discard loading key in finally: block'
+  );
+
+  // 2.2 Prohibition of caching empty failures
+  assert.ok(
+    code.includes('if timeline:') && code.includes('self.cache[key] = timeline'),
+    'v3.5.2: empty failure timeline must NOT be cached in self.cache[key]'
+  );
+
+  // 2.3 Soft Auto-Retry
+  assert.ok(
+    code.includes('_lyrics_retry_count < 3') && code.includes('_last_lyrics_retry'),
+    'v3.5.2: must auto-retry lyrics fetch up to 3 times for active tracks'
+  );
+
+  // BLOCK 3: Daily Single-Stream Logging
+  // 3.1 Removal of log level selector
+  assert.ok(
+    !code.includes('key="log_level"'),
+    'v3.5.3: log_level selector must be removed from settings menu'
+  );
+
+  // 3.2 Daily files ClaudePet_YYYY-MM-DD.txt
+  assert.ok(
+    code.includes('ClaudePet_{day_str}.txt') || code.includes('ClaudePet_%Y-%m-%d'),
+    'v3.5.3: log files must be named ClaudePet_YYYY-MM-DD.txt'
+  );
+
+  // 3.3 Detailed HTTP context in _req
+  assert.ok(
+    code.includes('HTTP {status} len=') && code.includes('LYRICS_NET'),
+    'v3.5.3: _req must log detailed HTTP status code, URL, and body length'
+  );
+});
