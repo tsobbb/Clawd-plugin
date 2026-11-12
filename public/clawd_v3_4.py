@@ -173,7 +173,7 @@ KEYWORDS = (
 )
 
 PHRASES = {
-    "hello": ["Привет!", "Я Clawd v3.4!", "О, это ты!", "Готов тусить!", "Чем займёмся?"],
+    "hello": ["Привет!", "Я Clawd v3.5!", "О, это ты!", "Готов тусить!", "Чем займёмся?"],
     "idle": [
         "Чем помочь?", "Хм…", "Думаю…", "Можно я тут посижу?",
         "Ты молодец!", "Не забудь попить воды", "Пип-пип!",
@@ -364,8 +364,14 @@ class ClaudeLogger:
             log(f"[{__id__}] logger init error: {e}")
 
     def _start_writer(self):
+        self._stop_event.clear()
         self._writer_thread = threading.Thread(target=self._writer_worker, daemon=True, name="claude_log_writer")
         self._writer_thread.start()
+
+    def ensure_started(self):
+        if self._writer_thread is None or not self._writer_thread.is_alive():
+            self._init_dirs()
+            self._start_writer()
 
     def _writer_worker(self):
         batch = []
@@ -404,7 +410,7 @@ class ClaudeLogger:
             error_lines = []
             for level, tag, line in batch:
                 daily_lines.append(line + "\n")
-                if level == "ERROR":
+                if level in ("ERROR", "WARN"):
                     error_lines.append(line + "\n")
 
             if daily_lines:
@@ -942,6 +948,8 @@ class ClawdPetPlugin(BasePlugin):
         self._last_rendered_y = None
         self._last_rendered_rot = None
         self._last_rendered_frame_key = None
+        self._last_rendered_bmp = None
+        self._bubble_mode = None
 
         self._lyrics_helper = LyricsHelper(logger_cb=self._add_debug_log)
         self._current_track_id = None
@@ -986,6 +994,8 @@ class ClawdPetPlugin(BasePlugin):
         # Телеметрия производительности (60с сводка)
         self._last_summary_time = time.monotonic()
         self._tick_times = collections.deque(maxlen=120)
+        self._frame_intervals = collections.deque(maxlen=120)
+        self._last_tick_start = 0.0
         self._platform_scan_times = collections.deque(maxlen=20)
         self._platforms_cache = []
         self._last_platforms_scan_time = 0.0
@@ -996,6 +1006,7 @@ class ClawdPetPlugin(BasePlugin):
         CLOG.log_info("APP", msg)
 
     def on_plugin_load(self):
+        CLOG.ensure_started()
         CLOG.log_info("LOAD", f"Загрузка Clawd v{__version__} by {__author__}...")
         self._reload_cfg()
         self._handler = Handler(Looper.getMainLooper())
@@ -1019,7 +1030,7 @@ class ClawdPetPlugin(BasePlugin):
         run_on_ui_thread(lambda: self._start(greet=True))
 
     def on_plugin_unload(self):
-        CLOG.log_info("UNLOAD", "Выгрузка Clawd v3.4...")
+        CLOG.log_info("UNLOAD", f"Выгрузка Clawd v{__version__}...")
         self._unloaded = True
         self._running = False
 
@@ -1071,7 +1082,7 @@ class ClawdPetPlugin(BasePlugin):
                 req = urllib.request.Request(
                     url,
                     headers={
-                        "User-Agent": "ClawdPet/3.4 (Android)",
+                        "User-Agent": f"ClawdPet/{__version__} (Android)",
                         "Host": "127.0.0.1:44444",
                     },
                 )
@@ -1107,7 +1118,7 @@ class ClawdPetPlugin(BasePlugin):
                 with self._bridge_lock:
                     self._bridge_data = fallback_data
 
-            time.sleep(self._bridge_interval)
+            self._bridge_stop_event.wait(self._bridge_interval)
 
     def _read_fallback_sync_json(self) -> Optional[Dict[str, Any]]:
         if not CLOG.base_dir:
@@ -1200,7 +1211,7 @@ class ClawdPetPlugin(BasePlugin):
         eaten = int(self.get_setting("eaten_count", 0) or 0)
         cleaned = int(self.get_setting("poops_cleaned", 0) or 0)
         return [
-            Header(text="Питомец Clawd v3.4"),
+            Header(text=f"Питомец Clawd v{__version__}"),
             Switch(
                 key="show",
                 text="Показывать питомца",
@@ -1421,7 +1432,7 @@ class ClawdPetPlugin(BasePlugin):
             ]
 
             b = AlertDialog.Builder(ctx)
-            b.setTitle("Тестовый полигон Clawd v3.4")
+            b.setTitle(f"Тестовый полигон Clawd v{__version__}")
             items = [f"{t[0]}\n• {t[1]}" for t in tests]
 
             def _on_click(_d, which):
@@ -1778,6 +1789,7 @@ class ClawdPetPlugin(BasePlugin):
         for view in list(self._particles):
             self._remove_view(view)
         self._particles = []
+        self._remove_view(self._laser_view)
         self._remove_view(self._bubble)
         self._remove_view(self._pet)
         self._pet = None
@@ -1785,12 +1797,30 @@ class ClawdPetPlugin(BasePlugin):
         self._bubble_text = None
         self._bubble_subtext = None
         self._media_controls_layout = None
+        self._laser_view = None
         self._decor = None
         self._touch_listener = None
         self._poop_listener = None
         self._touch = None
         self._platform = None
         self._platforms = []
+        self._bubble_mode = None
+        self._last_rendered_bmp = None
+        self._last_rendered_frame_key = None
+        for bmp in list(self._frames.values()):
+            try:
+                if bmp is not None:
+                    bmp.recycle()
+            except Exception:
+                pass
+        self._frames = {}
+        for bmp in list(self._particle_bitmaps.values()):
+            try:
+                if bmp is not None:
+                    bmp.recycle()
+            except Exception:
+                pass
+        self._particle_bitmaps = {}
         if self._state in ("press", "drag", "pet", "hang", "peek"):
             self._state = "idle"
 
@@ -1817,6 +1847,18 @@ class ClawdPetPlugin(BasePlugin):
     def _rebuild_sprites(self):
         old_w, old_h = self._w, self._h
         self._dp_cache.clear()
+        if self._pet is not None:
+            try:
+                self._pet.setImageBitmap(None)
+            except Exception:
+                pass
+        self._last_rendered_bmp = None
+        for bmp in list(self._frames.values()):
+            try:
+                if bmp is not None:
+                    bmp.recycle()
+            except Exception:
+                pass
         self._frames = {}
         self._particle_bitmaps = {}
         self._frame_key = None
@@ -1830,7 +1872,7 @@ class ClawdPetPlugin(BasePlugin):
         lp.width = self._w
         lp.height = self._h
         self._pet.setLayoutParams(lp)
-        self._hop(AndroidUtilities.dp(300))
+        self._hop(self._dp(300))
         self._schedule(16)
 
     def _palette(self):
@@ -1862,17 +1904,26 @@ class ClawdPetPlugin(BasePlugin):
 
     def _get_frame(self, key):
         bmp = self._frames.get(key)
-        if bmp is None:
-            if len(self._frames) >= MAX_FRAME_CACHE:
-                old_key = next(iter(self._frames))
-                old_bmp = self._frames.pop(old_key)
-                if old_bmp is not None and old_bmp != getattr(self, "_last_rendered_bmp", None):
-                    try:
-                        old_bmp.recycle()
-                    except Exception:
-                        pass
-            bmp = self._render_frame(key)
-            self._frames[key] = bmp
+        if bmp is not None:
+            # LRU-обновление порядка использования
+            self._frames[key] = self._frames.pop(key)
+            return bmp
+        if len(self._frames) >= MAX_FRAME_CACHE:
+            evict_key = None
+            for cand_key, cand_bmp in self._frames.items():
+                if cand_bmp != self._last_rendered_bmp:
+                    evict_key = cand_key
+                    break
+            if evict_key is None:
+                evict_key = next(iter(self._frames))
+            old_bmp = self._frames.pop(evict_key)
+            if old_bmp is not None and old_bmp != getattr(self, "_last_rendered_bmp", None):
+                try:
+                    old_bmp.recycle()
+                except Exception:
+                    pass
+        bmp = self._render_frame(key)
+        self._frames[key] = bmp
         return bmp
 
     def _render_frame(self, key):
@@ -2022,7 +2073,11 @@ class ClawdPetPlugin(BasePlugin):
             px(left + 4, top - 4, right - 4, top - 1, 0xFF7B1FA2)
             px((left + right) // 2, top - 5, (left + right) // 2 + 1, top - 4, 0xFFFFD700)
 
-        return Bitmap.createBitmap(jarray(jint)(pixel_array), GRID_W, GRID_H, Bitmap.Config.ARGB_8888)
+        small_bmp = Bitmap.createBitmap(jarray(jint)(pixel_array), GRID_W, GRID_H, Bitmap.Config.ARGB_8888)
+        s = max(2, int(self._unit))
+        bmp = Bitmap.createScaledBitmap(small_bmp, GRID_W * s, GRID_H * s, False)
+        small_bmp.recycle()
+        return bmp
 
     def _particle_bitmap(self, kind, is_gold=False):
         cache_key = f"{kind}_gold" if is_gold else kind
@@ -2145,6 +2200,11 @@ class ClawdPetPlugin(BasePlugin):
         if not self._running or self._paused:
             return
         t0 = time.monotonic()
+        if self._last_tick_start > 0.0:
+            interval_ms = (t0 - self._last_tick_start) * 1000.0
+            if 1.0 <= interval_ms <= 160.0:
+                self._frame_intervals.append(interval_ms)
+        self._last_tick_start = t0
         try:
             self._step()
         except Exception as e:
@@ -2269,8 +2329,18 @@ class ClawdPetPlugin(BasePlugin):
                             expected_idx = idx_item
                         else:
                             break
-                    if expected_idx >= 0 and expected_idx != self._current_lyric_idx:
-                        self._do_karaoke_line_switch()
+                    if expected_idx >= 0:
+                        t_curr = self._lyrics_timeline[expected_idx][0]
+                        t_next = (
+                            self._lyrics_timeline[expected_idx + 1][0]
+                            if expected_idx + 1 < len(self._lyrics_timeline)
+                            else t_curr + 5.0
+                        )
+                        line_dur = t_next - t_curr
+                        sing_until = t_curr + min(line_dur - 0.7, 5.0) if line_dur > 5.5 else t_next
+                        target_idx = expected_idx if t_karaoke <= sing_until else -2
+                        if target_idx != self._current_lyric_idx:
+                            self._do_karaoke_line_switch()
         if self._decor.getWidth() <= 0:
             return
 
@@ -2373,7 +2443,9 @@ class ClawdPetPlugin(BasePlugin):
         if self._tick_times:
             avg_tick = sum(self._tick_times) / len(self._tick_times)
             max_tick = max(self._tick_times)
-            fps = 1000.0 / max(1.0, avg_tick)
+        if self._frame_intervals:
+            avg_interval = sum(self._frame_intervals) / len(self._frame_intervals)
+            fps = 1000.0 / max(1.0, avg_interval)
 
         avg_scan = 0.0
         if self._platform_scan_times:
@@ -2409,7 +2481,9 @@ class ClawdPetPlugin(BasePlugin):
             self._last_checked_clip = clip_text
 
             # Приватность: текст буфера не логируем! Реагирует ТОЛЬКО на валидные ссылки SoundCloud
-            if "soundcloud.com/" in clip_text:
+            sc_match = re.search(r"https?://(?:on\.)?soundcloud\.com/\S+", clip_text)
+            if sc_match:
+                sc_url = sc_match.group(0)
                 CLOG.log_info("CLIPBOARD", "Обнаружена SoundCloud ссылка в буфере обмена")
 
                 def _on_resolved(res):
@@ -2418,7 +2492,7 @@ class ClawdPetPlugin(BasePlugin):
                         run_on_ui_thread(lambda: self._start_custom_song(f"{a} - {t}"))
 
                 threading.Thread(
-                    target=lambda: _on_resolved(self._lyrics_helper.resolve_soundcloud_url(clip_text)),
+                    target=lambda u=sc_url: _on_resolved(self._lyrics_helper.resolve_soundcloud_url(u)),
                     daemon=True,
                 ).start()
         except Exception:
@@ -3049,7 +3123,9 @@ class ClawdPetPlugin(BasePlugin):
 
         if key != self._last_rendered_frame_key:
             self._last_rendered_frame_key = key
-            self._pet.setImageBitmap(self._get_frame(key))
+            bmp = self._get_frame(key)
+            self._last_rendered_bmp = bmp
+            self._pet.setImageBitmap(bmp)
 
         if self._last_rendered_x != cur_x:
             self._last_rendered_x = cur_x
@@ -3112,11 +3188,16 @@ class ClawdPetPlugin(BasePlugin):
         now = time.monotonic()
         pointer_count = event.getPointerCount()
 
-        if pointer_count >= 2:
+        if pointer_count >= 2 and action != MotionEvent.ACTION_POINTER_UP:
             self._laser_active = True
             try:
-                lx = float(event.getX(1))
-                ly = float(event.getY(1))
+                cur_px = self._last_rendered_x if self._last_rendered_x is not None else self._x
+                cur_py = self._last_rendered_y if self._last_rendered_y is not None else (self._y + self._hop_off)
+                lx = float(cur_px) + float(event.getX(1))
+                ly = float(cur_py) + float(event.getY(1))
+                if self._decor is not None and self._decor.getWidth() > 0:
+                    lx = clamp(lx, 0.0, float(self._decor.getWidth()))
+                    ly = clamp(ly, 0.0, float(self._decor.getHeight()))
             except Exception:
                 lx, ly = rx, ry
             self._run_towards(lx, ly)
@@ -3196,14 +3277,14 @@ class ClawdPetPlugin(BasePlugin):
                     self._laser_view.setVisibility(View.GONE)
                 return
 
-            size = self._dp(10)
+            size = max(4, int(self._dp(10)))
             if self._laser_view is None and self._decor is not None:
                 ctx = self._decor.getContext()
                 lv = View(ctx)
                 gd = GradientDrawable()
                 gd.setShape(GradientDrawable.OVAL)
                 gd.setColor(as_java_color(0xFFFF0033))
-                gd.setStroke(max(1, self._dp(2)), as_java_color(0x66FF0033))
+                gd.setStroke(max(1, int(self._dp(2))), as_java_color(0x66FF0033))
                 lv.setBackground(gd)
                 lp = FrameLayout.LayoutParams(size, size)
                 self._decor.addView(lv, lp)
@@ -3370,6 +3451,13 @@ class ClawdPetPlugin(BasePlugin):
                 continue
 
             incoming = True
+            if sender_name is None and from_uid > 0:
+                try:
+                    user_obj = MessagesController.getInstance(account).getUser(from_uid)
+                    if user_obj is not None:
+                        sender_name = str(UserObject.getFirstName(user_obj) or "").strip() or None
+                except Exception:
+                    pass
             text = message.messageOwner.message if message.messageOwner is not None else None
             if text:
                 t_str = str(text)
@@ -3477,20 +3565,17 @@ class ClawdPetPlugin(BasePlugin):
         is_playing = False
         position_known = True
 
-        if self._test_karaoke_active:
-            self._track_is_playing = True
-            return
-
-        # 2.1 Приоритеты источников звука:
-        # Telegram Native (строго isMusic) -> Clawd Bridge -> Ручной ввод -> Буфер обмена
-        tg_playing = False
+        # Проверка окончания тестового режима караоке и приоритета реального воспроизведения
+        tg_playing_now = False
+        tg_paused_music = None
+        bridge_snapshot = None
         if self._cfg.get("dance", True):
             try:
                 controller = MediaController.getInstance()
                 playing = controller.getPlayingMessageObject()
-                if playing is not None and controller.isPlayingMessage(playing) and not controller.isMessagePaused():
-                    if playing.isMusic():
-                        tg_playing = True
+                if playing is not None and playing.isMusic():
+                    if controller.isPlayingMessage(playing) and not controller.isMessagePaused():
+                        tg_playing_now = True
                         kind = "music"
                         is_playing = True
                         player_name = "Telegram"
@@ -3501,23 +3586,62 @@ class ClawdPetPlugin(BasePlugin):
                         prog = float(getattr(playing, "audioProgress", 0.0))
                         track_position_ms = int(dur_sec * prog * 1000)
                         position_known = True
-                    # Голосовые и кружки караоке НЕ активируют
+                    else:
+                        tg_paused_music = playing
             except Exception as e:
                 CLOG.log_error("TG_AUDIO", "Poll error", e)
 
-            # Если плеер Telegram на паузе — источник немедленно переключается на мост
-            if not tg_playing:
+            if not tg_playing_now:
                 with self._bridge_lock:
-                    b_data = self._bridge_data
-                if b_data and b_data.get("has_media") and b_data.get("is_playing"):
+                    bridge_snapshot = self._bridge_data
+
+        if self._test_karaoke_active:
+            test_done = False
+            if not self._cfg.get("karaoke", True) or tg_playing_now or (bridge_snapshot and bridge_snapshot.get("has_media") and bridge_snapshot.get("is_playing")):
+                test_done = True
+            elif self._lyrics_timeline and self._get_current_track_pos(now) > self._lyrics_timeline[-1][0] + 6.0:
+                test_done = True
+            elif not self._lyrics_timeline and self._track_base_time > 0.0 and (now - self._track_base_time > 10.0):
+                test_done = True
+            if not test_done:
+                self._track_is_playing = True
+                return
+            self._test_karaoke_active = False
+
+        # 2.1 Приоритеты источников звука:
+        # Telegram Playing -> Clawd Bridge Playing -> Telegram Paused -> Clawd Bridge Paused
+        tg_playing = tg_playing_now
+        if self._cfg.get("dance", True):
+            if not tg_playing:
+                if bridge_snapshot and bridge_snapshot.get("has_media") and bridge_snapshot.get("is_playing"):
                     kind = "music"
-                    is_playing = bool(b_data.get("is_playing"))
-                    player_name = str(b_data.get("player") or "Bridge")
-                    track_artist = str(b_data.get("artist") or "")
-                    track_title = str(b_data.get("title") or "")
-                    track_position_ms = int(b_data.get("position_ms") or 0)
-                    duration_ms = int(b_data.get("duration_ms") or 0)
-                    position_known = bool(b_data.get("position_known", True))
+                    is_playing = True
+                    player_name = str(bridge_snapshot.get("player") or "Bridge")
+                    track_artist = str(bridge_snapshot.get("artist") or "")
+                    track_title = str(bridge_snapshot.get("title") or "")
+                    track_position_ms = int(bridge_snapshot.get("position_ms") or 0)
+                    duration_ms = int(bridge_snapshot.get("duration_ms") or 0)
+                    position_known = bool(bridge_snapshot.get("position_known", True))
+                elif tg_paused_music is not None:
+                    kind = "music"
+                    is_playing = False
+                    player_name = "Telegram"
+                    track_title = str(tg_paused_music.getMusicTitle() or "").strip()
+                    track_artist = str(tg_paused_music.getMusicAuthor() or "").strip()
+                    dur_sec = float(getattr(tg_paused_music, "getDuration", lambda: 0)())
+                    duration_ms = int(dur_sec * 1000)
+                    prog = float(getattr(tg_paused_music, "audioProgress", 0.0))
+                    track_position_ms = int(dur_sec * prog * 1000)
+                    position_known = True
+                elif bridge_snapshot and bridge_snapshot.get("has_media"):
+                    kind = "music"
+                    is_playing = False
+                    player_name = str(bridge_snapshot.get("player") or "Bridge")
+                    track_artist = str(bridge_snapshot.get("artist") or "")
+                    track_title = str(bridge_snapshot.get("title") or "")
+                    track_position_ms = int(bridge_snapshot.get("position_ms") or 0)
+                    duration_ms = int(bridge_snapshot.get("duration_ms") or 0)
+                    position_known = bool(bridge_snapshot.get("position_known", True))
 
         if track_title:
             clean_a, clean_t = self._lyrics_helper.clean_metadata(track_artist, track_title)
@@ -3552,9 +3676,12 @@ class ClawdPetPlugin(BasePlugin):
                     CLOG.log_info("TRACK", "Обнаружена реклама: пропуск поиска слов")
                 elif self._cfg.get("karaoke", True):
                     self._say_track_detected(clean_a, clean_t)
+                    expected_track_id = triplet_id
 
                     def _on_lyrics_loaded(tl):
                         def _apply():
+                            if self._unloaded or self._current_track_id != expected_track_id:
+                                return
                             self._lyrics_timeline = tl
                             if not tl:
                                 self._say("no_lyrics")
@@ -3575,8 +3702,12 @@ class ClawdPetPlugin(BasePlugin):
                         artist=clean_a,
                         title=clean_t,
                     )
+                    expected_track_id = triplet_id
+
                     def _on_retry_loaded(tl):
                         def _apply_retry():
+                            if self._unloaded or self._current_track_id != expected_track_id:
+                                return
                             if tl:
                                 self._lyrics_timeline = tl
                                 self._reschedule_karaoke_switch()
@@ -3590,7 +3721,7 @@ class ClawdPetPlugin(BasePlugin):
         self._position_known = position_known
         if kind == "music":
             # 1.2 Компенсация задержки передачи моста: Δ_comp = 0.22 с
-            if not tg_playing:
+            if not tg_playing and tg_paused_music is None:
                 t_new = (track_position_ms / 1000.0) + 0.22
             else:
                 t_new = track_position_ms / 1000.0
@@ -3604,6 +3735,7 @@ class ClawdPetPlugin(BasePlugin):
             if not is_playing:
                 # Пауза: значение T_calc замораживается на месте
                 self._track_is_playing = False
+                self._is_singing = False
                 self._track_base_pos = t_calc
                 self._track_base_time = now
                 if self._handler and self._karaoke_switch_r:
@@ -3624,7 +3756,11 @@ class ClawdPetPlugin(BasePlugin):
                     self._track_base_pos = t_new
                     self._track_base_time = now
                     # Немедленный перерасчет таймера караоке
-                    self._reschedule_karaoke_switch()
+                    if resumed:
+                        self._current_lyric_idx = -1
+                        self._do_karaoke_line_switch()
+                    else:
+                        self._reschedule_karaoke_switch()
         else:
             self._track_is_playing = False
 
@@ -3634,6 +3770,12 @@ class ClawdPetPlugin(BasePlugin):
         self._media = kind
         if kind is None:
             self._is_singing = False
+            self._current_track_id = None
+            self._lyrics_timeline = []
+            self._current_lyric_idx = -1
+            self._lyrics_retry_count = 0
+            self._track_base_pos = 0.0
+            self._track_base_time = 0.0
             self._hide_bubble()
             if self._handler and self._karaoke_switch_r:
                 self._handler.removeCallbacks(self._karaoke_switch_r)
@@ -3799,8 +3941,12 @@ class ClawdPetPlugin(BasePlugin):
 
         try:
             view.animate().cancel()
+            gen = self._bubble_gen
+
             def _on_faded_out():
                 try:
+                    if gen != self._bubble_gen or self._bubble_mode != "karaoke" or not self._bubble_visible:
+                        return
                     view.setText(new_text)
                     view.setTranslationY(shift_dp)
                     view.animate().translationY(0.0).alpha(target_alpha).setDuration(150).start()
@@ -3817,28 +3963,29 @@ class ClawdPetPlugin(BasePlugin):
         if self._bubble is None or self._bubble_text is None:
             return
         try:
-            bg = GradientDrawable()
-            bg.setCornerRadius(float(AndroidUtilities.dp(13)))
-            bg.setColor(as_java_color(0xEE1A1A1E))
-            bg.setStroke(max(1, AndroidUtilities.dp(1)), as_java_color(0x33FFFFFF))
-            self._bubble.setBackground(bg)
+            if self._bubble_mode != "karaoke":
+                self._bubble_mode = "karaoke"
+                bg = GradientDrawable()
+                bg.setCornerRadius(float(self._dp(13)))
+                bg.setColor(as_java_color(0xEE1A1A1E))
+                bg.setStroke(max(1, int(self._dp(1))), as_java_color(0x33FFFFFF))
+                self._bubble.setBackground(bg)
 
-            # 2.2 Стабилизация караоке-виджета: фиксированная геометрия 210-260 dp
-            self._bubble.setMinimumWidth(AndroidUtilities.dp(210))
-            self._bubble.setPadding(
-                AndroidUtilities.dp(12), AndroidUtilities.dp(7),
-                AndroidUtilities.dp(12), AndroidUtilities.dp(7),
-            )
-            if self._bubble_text is not None:
-                self._bubble_text.setMinimumWidth(AndroidUtilities.dp(210))
-                self._bubble_text.setMaxWidth(AndroidUtilities.dp(260))
-                self._bubble_text.setGravity(Gravity.CENTER_HORIZONTAL)
-                self._bubble_text.setLayoutParams(LinearLayout.LayoutParams(-1, -2))
-            if self._bubble_subtext is not None:
-                self._bubble_subtext.setMinimumWidth(AndroidUtilities.dp(210))
-                self._bubble_subtext.setMaxWidth(AndroidUtilities.dp(260))
-                self._bubble_subtext.setGravity(Gravity.CENTER_HORIZONTAL)
-                self._bubble_subtext.setLayoutParams(LinearLayout.LayoutParams(-1, -2))
+                # 2.2 Стабилизация караоке-виджета: фиксированная геометрия 210-260 dp
+                self._bubble.setMinimumWidth(AndroidUtilities.dp(210))
+                pad12 = int(self._dp(12))
+                pad7 = int(self._dp(7))
+                self._bubble.setPadding(pad12, pad7, pad12, pad7)
+                if self._bubble_text is not None:
+                    self._bubble_text.setMinimumWidth(AndroidUtilities.dp(210))
+                    self._bubble_text.setMaxWidth(AndroidUtilities.dp(260))
+                    self._bubble_text.setGravity(Gravity.CENTER_HORIZONTAL)
+                    self._bubble_text.setLayoutParams(LinearLayout.LayoutParams(-1, -2))
+                if self._bubble_subtext is not None:
+                    self._bubble_subtext.setMinimumWidth(AndroidUtilities.dp(210))
+                    self._bubble_subtext.setMaxWidth(AndroidUtilities.dp(260))
+                    self._bubble_subtext.setGravity(Gravity.CENTER_HORIZONTAL)
+                    self._bubble_subtext.setLayoutParams(LinearLayout.LayoutParams(-1, -2))
 
             self._bubble_text.setTextColor(as_java_color(0xFFFFFFFF))
             self._animate_text_change(self._bubble_text, current_text, target_alpha=1.0)
@@ -3926,7 +4073,7 @@ class ClawdPetPlugin(BasePlugin):
         self._current_track_id = track_id
         self._lyrics_timeline = []
         self._current_lyric_idx = -1
-        self._is_singing = True
+        self._is_singing = False
         self._media = "music"
         self._track_is_playing = True
         self._track_base_pos = 0.0
@@ -3936,11 +4083,15 @@ class ClawdPetPlugin(BasePlugin):
         self._user_offset = self._session_offsets.get(f"{a} - {t}", 0.0)
 
         self._say_track_detected(a, t)
+        expected_track_id = track_id
 
         def _on_loaded(tl):
             def _apply():
+                if self._unloaded or self._current_track_id != expected_track_id:
+                    return
                 self._lyrics_timeline = tl
                 if not tl:
+                    self._is_singing = False
                     self._say("no_lyrics")
                 self._reschedule_karaoke_switch()
             run_on_ui_thread(_apply)
@@ -3968,35 +4119,47 @@ class ClawdPetPlugin(BasePlugin):
         now = time.monotonic()
 
         try:
-            bg = GradientDrawable()
-            bg.setCornerRadius(float(AndroidUtilities.dp(12)))
-            bg.setColor(Theme.getColor(Theme.key_windowBackgroundWhite))
-            bg.setStroke(max(1, AndroidUtilities.dp(1)), Theme.getColor(Theme.key_divider))
-            self._bubble.setBackground(bg)
+            self._bubble_gen += 1
+            self._bubble.animate().cancel()
+            if self._bubble_text is not None:
+                self._bubble_text.animate().cancel()
+                self._bubble_text.setTranslationY(0.0)
+                self._bubble_text.setAlpha(1.0)
+            if self._bubble_subtext is not None:
+                self._bubble_subtext.animate().cancel()
+                self._bubble_subtext.setTranslationY(0.0)
 
-            # 2.1 Изоляция стилей обычной речи: компактное облачко WRAP_CONTENT с паддингами 10 dp
-            self._bubble.setMinimumWidth(0)
-            self._bubble.setLayoutParams(FrameLayout.LayoutParams(-2, -2))
-            pad10 = AndroidUtilities.dp(10)
-            pad6 = AndroidUtilities.dp(6)
-            self._bubble.setPadding(pad10, pad6, pad10, pad6)
+            if self._bubble_mode != "speech":
+                self._bubble_mode = "speech"
+                bg = GradientDrawable()
+                bg.setCornerRadius(float(self._dp(12)))
+                bg.setColor(Theme.getColor(Theme.key_windowBackgroundWhite))
+                bg.setStroke(max(1, int(self._dp(1))), Theme.getColor(Theme.key_divider))
+                self._bubble.setBackground(bg)
+
+                # 2.1 Изоляция стилей обычной речи: компактное облачко WRAP_CONTENT с паддингами 10 dp
+                self._bubble.setMinimumWidth(0)
+                self._bubble.setLayoutParams(FrameLayout.LayoutParams(-2, -2))
+                pad10 = int(self._dp(10))
+                pad6 = int(self._dp(6))
+                self._bubble.setPadding(pad10, pad6, pad10, pad6)
+
+                if self._bubble_text is not None:
+                    self._bubble_text.setMinimumWidth(0)
+                    self._bubble_text.setMaxWidth(AndroidUtilities.dp(200))
+                    self._bubble_text.setGravity(Gravity.NO_GRAVITY)
+                    self._bubble_text.setLayoutParams(LinearLayout.LayoutParams(-2, -2))
+                    self._bubble_text.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlackText))
+                if self._bubble_subtext is not None:
+                    self._bubble_subtext.setVisibility(View.GONE)
+                if self._media_controls_layout is not None:
+                    self._media_controls_layout.setVisibility(View.GONE)
 
             if self._bubble_text is not None:
-                self._bubble_text.setMinimumWidth(0)
-                self._bubble_text.setMaxWidth(AndroidUtilities.dp(200))
-                self._bubble_text.setGravity(Gravity.NO_GRAVITY)
-                self._bubble_text.setLayoutParams(LinearLayout.LayoutParams(-2, -2))
-                self._bubble_text.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlackText))
                 self._bubble_text.setText(text)
-            if self._bubble_subtext is not None:
-                self._bubble_subtext.setVisibility(View.GONE)
-            if self._media_controls_layout is not None:
-                self._media_controls_layout.setVisibility(View.GONE)
 
-            self._bubble.animate().cancel()
             self._bubble.setAlpha(0.0)
             self._bubble.setVisibility(View.VISIBLE)
-            self._bubble_gen += 1
             self._bubble_visible = True
             self._bubble_fade_in = True
             self._bubble_until = now + 2.0 + len(text) * 0.05
@@ -4069,9 +4232,9 @@ class ClawdPetPlugin(BasePlugin):
                 pass
 
             # Исключение: собственные элементы плагина
-            if view.equals(self._pet) or view.equals(self._bubble):
+            if view.equals(self._pet) or view.equals(self._bubble) or (self._laser_view is not None and view.equals(self._laser_view)):
                 continue
-            if any(view.equals(p) for p in self._poops):
+            if any(view.equals(p) for p in self._poops) or any(view.equals(pt) for pt in self._particles):
                 continue
             if any(item.get("view_ref") and view.equals(item["view_ref"].get()) for item in self._eaten):
                 continue
@@ -4294,7 +4457,7 @@ class ClawdPetPlugin(BasePlugin):
         try:
             bmp = self._particle_bitmap("poop", is_gold=is_gold)
             bw, bh = bmp.getWidth(), bmp.getHeight()
-            pad = AndroidUtilities.dp(6)
+            pad = max(1, int(self._dp(6)))
             view = ImageView(self._pet.getContext())
             view.setImageBitmap(bmp)
             view.setScaleType(ImageView.ScaleType.CENTER)
