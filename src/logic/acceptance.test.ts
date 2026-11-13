@@ -38,8 +38,8 @@ test('Clawd v3.4 contains all 5 critical bugfixes from ТЗ', () => {
     '1.2: Missing was_paused and resumed state transition tracking'
   );
   assert.ok(
-    (code.includes('drift > 1.2') || code.includes('drift > 0.25')) && code.includes('self._track_base_time == 0.0 or resumed'),
-    '1.2: Missing base update condition on resumed == True'
+    code.includes('self._anchor_mono <= 0.0') && code.includes('resumed'),
+    '1.2: Missing anchor reset condition on resumed == True'
   );
 
   // Bugfix 1.3: Instrumental pause scheduling and mouth closure
@@ -126,19 +126,6 @@ test('Clawd v3.5 satisfies all requirements from ТЗ v3.5', () => {
   const filePath = path.resolve(process.cwd(), 'public/clawd_v3_4.py');
   const code = fs.readFileSync(filePath, 'utf-8');
 
-  // РАЗДЕЛ 1: Караоке-тайминги, устранение джиттера и синхронизация
-  // 1.1 Порог джиттера drift > 1.2 с
-  assert.ok(
-    code.includes('drift > 1.2'),
-    '1.1: Дрейф времени должен проверяться по порогу drift > 1.2'
-  );
-
-  // 1.2 Компенсация задержки моста Δ_comp = 0.22 с
-  assert.ok(
-    code.includes('(track_position_ms / 1000.0) + 0.22'),
-    '1.2: Должна прибавляться компенсация задержки моста +0.22с'
-  );
-
   // 1.3 Отказоустойчивый чекер строк в _step() раз в 100 мс
   assert.ok(
     code.includes('_last_failsafe_check') && code.includes('0.10'),
@@ -168,13 +155,10 @@ test('Clawd v3.5 satisfies all requirements from ТЗ v3.5', () => {
   );
 
   // РАЗДЕЛ 2: Разделение UI облачка: речь vs караоке
-  // 2.1 Изоляция стилей обычной речи (_say: setMinimumWidth(0) и WRAP_CONTENT)
   assert.ok(
     code.includes('self._bubble.setMinimumWidth(0)'),
     '2.1: В _say() минимальная ширина сбрасывается в 0'
   );
-
-  // 2.2 Стабилизация караоке-виджета (_show_karaoke_line: 210dp-260dp, center)
   assert.ok(
     code.includes('self._bubble.setMinimumWidth(AndroidUtilities.dp(210))'),
     '2.2: В _show_karaoke_line минимальная ширина фиксируется на 210dp'
@@ -187,8 +171,6 @@ test('Clawd v3.5 satisfies all requirements from ТЗ v3.5', () => {
     code.includes('Gravity.CENTER_HORIZONTAL'),
     '2.2: Выравнивание текста строго по центру Gravity.CENTER_HORIZONTAL'
   );
-
-  // 2.3 Бесшовная смена строк (5dp смещение за 150мс)
   assert.ok(
     code.includes('AndroidUtilities.dp(5)'),
     '2.3: Анимация сдвига строки строго 5dp'
@@ -205,57 +187,84 @@ test('Clawd v3.5 satisfies all requirements from ТЗ v3.5', () => {
   );
 
   // РАЗДЕЛ 4: Оптимизация производительности
-  // 4.1 Пакетная заливка пикселей спрайта
   assert.ok(
     code.includes('Bitmap.createBitmap(jarray(jint)(pixel_array), GRID_W, GRID_H'),
     '4.1: Рендеринг кадра спрайта выполняется пакетной передачей массива пикселей'
   );
-
-  // 4.2 Мемоизация и кэширование _dp
   assert.ok(
     code.includes('_dp_cache') && code.includes('self._dp_cache.get(value)'),
     '4.2: Метод _dp() мемоизирует результаты в _dp_cache'
   );
-
-  // 4.3 Ленивое сканирование платформ (500 мс кэш)
   assert.ok(
     code.includes('0.50') && code.includes('_last_platforms_scan_time'),
     '4.3: Время жизни кэша платформ 500 мс с заморозкой в idle/sleep'
   );
 });
 
-test('Clawd Bridge SSE, playback_speed, artwork and accent_color support', () => {
+test('Clawd Bridge v2.0: clean pet background, singing mouth toggle, 3-color gradients, SSE and monotonic anti-drift', () => {
   const filePath = path.resolve(process.cwd(), 'public/clawd_v3_4.py');
   const code = fs.readFileSync(filePath, 'utf-8');
 
+  // 1. Pet visual: NO aura oval + singing_mouth_enabled toggle defaulting to False
   assert.ok(
-    code.includes('http://127.0.0.1:44444/events') &&
-    code.includes('text/event-stream') &&
-    code.includes('line.startswith(":")'),
-    'SSE: /events stream with keepalive comment ignoring required'
+    !code.includes('_aura_view') && !code.includes('GradientDrawable.OVAL') || (code.includes('GradientDrawable.OVAL') && !code.includes('_aura_view')),
+    '1.1: Blue aura view around pet must be completely removed'
   );
+  assert.ok(!code.includes('_aura_view'), '1.1: _aura_view must not exist');
   assert.ok(
-    code.includes('http://127.0.0.1:44444/now-playing') &&
-    code.includes('_bridge_poll_once'),
-    'SSE: Fallback polling to /now-playing required'
+    code.includes('key="singing_mouth_enabled"') &&
+    code.includes('default=False') &&
+    code.includes('self._cfg.get("singing_mouth_enabled", False)'),
+    '1.2: singing_mouth_enabled toggle with default False must gate mouth animation'
   );
+
+  // 2. 3-color gradient border & background + artwork fetch condition
   assert.ok(
-    code.includes('playback_speed') &&
-    code.includes('_received_mono') &&
-    code.includes('* self._playback_speed'),
-    'Playback speed extrapolation with local receive timestamp required'
+    code.includes('accent_colors') &&
+    code.includes('derive_palette_3') &&
+    code.includes('LayerDrawable') &&
+    code.includes('GradientDrawable.Orientation.TL_BR') &&
+    code.includes('_step_gradient_anim'),
+    '2.1: Smooth 3-color gradient border and background via LayerDrawable + animation required'
   );
   assert.ok(
     code.includes('http://127.0.0.1:44444/artwork') &&
     code.includes('has_artwork') &&
+    code.includes('_artwork_last_has_flag') &&
     code.includes('BitmapFactory.decodeByteArray'),
-    'Artwork: /artwork fetch on track change when has_artwork is true'
+    '2.2: /artwork fetch on track change or has_artwork False->True required'
+  );
+
+  // 3. SSE >= 25s timeout, 1-2s reconnect, fallback polling 1.5-2.0s only when SSE disconnected
+  assert.ok(
+    code.includes('http://127.0.0.1:44444/events') &&
+    code.includes('text/event-stream') &&
+    code.includes('timeout=28.0') &&
+    code.includes('line.startswith(":")') &&
+    code.includes('not self._bridge_sse_connected'),
+    '3.1: SSE /events with >=25s timeout, keepalive ignore, and polling disabled while SSE connected required'
   );
   assert.ok(
-    code.includes('accent_color') &&
-    code.includes('parse_hex_color') &&
-    code.includes('_aura_view'),
-    'Accent color: #RRGGBB parsing and UI/aura highlighting required'
+    code.includes('http://127.0.0.1:44444/now-playing') &&
+    code.includes('_bridge_poll_once') &&
+    code.includes('wait(1.6)'),
+    '3.2: Fallback polling /now-playing at 1.5-2.0s interval required'
+  );
+
+  // 4. Monotonic anchor math, no +0.22 hack, 3-tier anti-drift, live anchor after LRC fetch
+  assert.ok(
+    !code.includes('+ 0.22'),
+    '4.1: Legacy +0.22s offset hack must be removed'
+  );
+  assert.ok(
+    code.includes('_anchor_pos_ms') &&
+    code.includes('_anchor_mono') &&
+    code.includes('_anchor_speed') &&
+    code.includes('* 1000.0 * self._anchor_speed') &&
+    code.includes('abs(delta) >= 180.0') &&
+    code.includes('abs(delta) > 50.0') &&
+    code.includes('_apply_fresh_bridge_anchor_and_jump') &&
+    code.includes('_clear_playback_anchors'),
+    '4.2: Monotonic anchor extrapolation, 3-tier anti-drift (>=180ms / >50ms), post-LRC live re-anchoring, and clean reset required'
   );
 });
-

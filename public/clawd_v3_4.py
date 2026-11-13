@@ -17,7 +17,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from android.content import ClipData, ClipboardManager, ComponentName, Context, DialogInterface, Intent
 from android.graphics import Bitmap, BitmapFactory, Canvas, Paint
-from android.graphics.drawable import GradientDrawable
+from android.graphics.drawable import Drawable, GradientDrawable, LayerDrawable
 from android.hardware import Sensor, SensorEventListener, SensorManager
 from android.media import AudioManager
 from android.os import BatteryManager, Environment, Handler, Looper, PowerManager, SystemClock
@@ -350,6 +350,35 @@ def parse_hex_color(raw: Optional[str]) -> Optional[int]:
         except Exception:
             return None
     return None
+
+
+DEFAULT_KARAOKE_PALETTE: Tuple[int, int, int] = (0xFF6B778D, 0xFF434C5E, 0xFF2B303B)
+
+
+def derive_palette_3(accent_color: Any, accent_colors: Any) -> Tuple[int, int, int]:
+    parsed: List[int] = []
+    if isinstance(accent_colors, (list, tuple)):
+        for item in accent_colors:
+            c = parse_hex_color(item) if isinstance(item, str) else (int(item) & 0xFFFFFFFF if isinstance(item, int) else None)
+            if c is not None:
+                parsed.append(c | 0xFF000000)
+                if len(parsed) == 3:
+                    break
+    if len(parsed) >= 3:
+        return (parsed[0], parsed[1], parsed[2])
+    base = parsed[0] if parsed else (
+        parse_hex_color(accent_color) if isinstance(accent_color, str) else (int(accent_color) & 0xFFFFFFFF if isinstance(accent_color, int) else None)
+    )
+    if len(parsed) == 2:
+        return (parsed[0], parsed[1], mix_color(parsed[1], 0xFF141828, 0.28))
+    if base is not None:
+        base_opaque = base | 0xFF000000
+        return (
+            mix_color(base_opaque, 0xFFFFFFFF, 0.24),
+            base_opaque,
+            mix_color(base_opaque, 0xFF121626, 0.30),
+        )
+    return DEFAULT_KARAOKE_PALETTE
 
 
 class ClaudeLogger:
@@ -927,13 +956,13 @@ class ClawdPetPlugin(BasePlugin):
         self._tick_r = None
         self._karaoke_switch_r = None
         self._auto_return_r = None
+        self._grad_anim_r = None
         self._running = False
         self._paused = False
         self._unloaded = False
         self._cfg = {}
 
         self._decor = None
-        self._aura_view = None
         self._pet = None
         self._bubble = None
         self._artwork_row = None
@@ -941,6 +970,7 @@ class ClawdPetPlugin(BasePlugin):
         self._artwork_title_tv = None
         self._artwork_bmp = None
         self._artwork_track_key = None
+        self._artwork_last_has_flag = False
         self._bubble_text = None
         self._bubble_subtext = None
         self._media_controls_layout = None
@@ -975,11 +1005,15 @@ class ClawdPetPlugin(BasePlugin):
         self._last_rendered_frame_key = None
         self._last_rendered_bmp = None
         self._bubble_mode = None
-        self._last_bubble_accent = None
-        self._last_aura_color = None
-        self._last_aura_x = None
-        self._last_aura_y = None
-        self._last_aura_visible = False
+        self._last_bubble_palette: Optional[Tuple[int, int, int]] = None
+        self._target_palette: Tuple[int, int, int] = DEFAULT_KARAOKE_PALETTE
+        self._grad_curr: Tuple[int, int, int] = DEFAULT_KARAOKE_PALETTE
+        self._grad_from: Tuple[int, int, int] = DEFAULT_KARAOKE_PALETTE
+        self._grad_target: Tuple[int, int, int] = DEFAULT_KARAOKE_PALETTE
+        self._grad_anim_start = 0.0
+        self._karaoke_border_gd = None
+        self._karaoke_bg_gd = None
+        self._karaoke_layer_drawable = None
 
         self._lyrics_helper = LyricsHelper(logger_cb=self._add_debug_log)
         self._current_track_id = None
@@ -992,7 +1026,11 @@ class ClawdPetPlugin(BasePlugin):
         self._last_failsafe_check = 0.0
         self._dp_cache: Dict[Any, float] = {}
 
-        # Синхронизация и джиттер
+        # Монотонный якорь синхронизации (ms + monotonic + speed) и анти-дрейф
+        self._anchor_pos_ms = 0.0
+        self._anchor_mono = 0.0
+        self._anchor_speed = 1.0
+        self._sync_offset_ms = 0.0
         self._track_base_pos = 0.0
         self._track_base_time = 0.0
         self._track_is_playing = False
@@ -1006,14 +1044,16 @@ class ClawdPetPlugin(BasePlugin):
         self._bridge_thread = None
         self._bridge_stop_event = threading.Event()
         self._bridge_consecutive_errors = 0
-        self._bridge_interval = 0.38  # 350-400 мс штатный polling fallback
+        self._bridge_interval = 1.6  # fallback polling 1.5–2.0 с только при отключенном SSE
         self._bridge_last_ping_latency = 0.0
         self._bridge_data: Optional[Dict[str, Any]] = None
         self._bridge_lock = threading.Lock()
         self._bridge_mode = "INIT"
         self._bridge_sse_resp = None
+        self._bridge_sse_connected = False
         self._bridge_push_pending = False
         self._last_sse_rx_mono = 0.0
+        self._last_processed_bridge_rx_mono = 0.0
 
         # Буфер обмена
         self._last_checked_clip = ""
@@ -1044,11 +1084,15 @@ class ClawdPetPlugin(BasePlugin):
     def on_plugin_load(self):
         CLOG.ensure_started()
         CLOG.log_info("LOAD", f"Загрузка Clawd v{__version__} by {__author__}...")
+        with self._bridge_lock:
+            self._bridge_data = None
+        self._clear_playback_anchors(reset_user_offset=True)
         self._reload_cfg()
         self._handler = Handler(Looper.getMainLooper())
         self._tick_r = R(self._tick)
         self._karaoke_switch_r = R(self._do_karaoke_line_switch)
         self._auto_return_r = R(self._on_auto_return_triggered)
+        self._grad_anim_r = R(self._step_gradient_anim)
 
         self.add_menu_item(
             MenuItemData(
@@ -1078,9 +1122,14 @@ class ClawdPetPlugin(BasePlugin):
                 self._handler.removeCallbacks(self._karaoke_switch_r)
             if self._auto_return_r is not None:
                 self._handler.removeCallbacks(self._auto_return_r)
+            if self._grad_anim_r is not None:
+                self._handler.removeCallbacks(self._grad_anim_r)
 
-        # Остановка фонового потока моста
+        # Остановка фонового потока моста и полная очистка якорей/буферов
         self._stop_bridge_daemon()
+        with self._bridge_lock:
+            self._bridge_data = None
+        self._clear_playback_anchors(reset_user_offset=True)
 
         delegate = self._msg_delegate
         self._msg_delegate = None
@@ -1131,15 +1180,16 @@ class ClawdPetPlugin(BasePlugin):
         run_on_ui_thread(_wake)
 
     def _on_bridge_payload(self, data: Dict[str, Any], mode: str, dt_ping: float = 0.0):
+        rx_mono = time.monotonic()
         if self._bridge_consecutive_errors >= 5:
             CLOG.log_info("BRIDGE", f"Связь восстановлена ({mode})! Сброс backoff")
         self._bridge_consecutive_errors = 0
-        self._bridge_interval = random.uniform(0.35, 0.40)
+        self._bridge_interval = 1.6
         self._bridge_mode = mode
         if dt_ping > 0.0:
             self._bridge_last_ping_latency = dt_ping
         payload = dict(data)
-        payload["_received_mono"] = time.monotonic()
+        payload["_received_mono"] = rx_mono
         payload["_is_sse_event"] = (mode == "SSE")
         with self._bridge_lock:
             self._bridge_data = payload
@@ -1157,7 +1207,7 @@ class ClawdPetPlugin(BasePlugin):
                     "Host": "127.0.0.1:44444",
                 },
             )
-            with urllib.request.urlopen(req, timeout=0.5) as resp:
+            with urllib.request.urlopen(req, timeout=1.0) as resp:
                 if resp.status == 200:
                     raw = resp.read().decode("utf-8")
                     data = json.loads(raw)
@@ -1182,15 +1232,16 @@ class ClawdPetPlugin(BasePlugin):
                     "Host": "127.0.0.1:44444",
                 },
             )
-            resp = urllib.request.urlopen(req, timeout=22.0)
+            resp = urllib.request.urlopen(req, timeout=28.0)
             self._bridge_sse_resp = resp
             if getattr(resp, "status", 200) != 200:
                 return False
             connected = True
+            self._bridge_sse_connected = True
             self._bridge_mode = "SSE"
             self._bridge_consecutive_errors = 0
             self._bridge_last_ping_latency = (time.monotonic() - t0) * 1000.0
-            CLOG.log_info("BRIDGE", "Подключен SSE-поток /events")
+            CLOG.log_info("BRIDGE", "Подключен SSE-поток /events (polling отключен)")
 
             event_name = ""
             data_lines: List[str] = []
@@ -1227,6 +1278,7 @@ class ClawdPetPlugin(BasePlugin):
             if not self._bridge_stop_event.is_set():
                 CLOG.log_debug("BRIDGE", f"SSE поток отключен ({e}), переход в fallback")
         finally:
+            self._bridge_sse_connected = False
             self._bridge_sse_resp = None
             if resp is not None:
                 try:
@@ -1242,29 +1294,29 @@ class ClawdPetPlugin(BasePlugin):
                 break
 
             if was_sse_connected:
-                # Короткая пауза перед переподключением SSE после разрыва потока
-                self._bridge_stop_event.wait(0.5)
+                # Переподключение SSE через 1.2 секунды после разрыва
+                self._bridge_stop_event.wait(1.2)
                 continue
 
-            # Fallback на обычный polling (/now-playing) с периодической попыткой вернуться на SSE
+            # Fallback polling GET /now-playing (1.5–2.0 с) ТОЛЬКО пока SSE не подключён
             poll_cycles = 0
-            while not self._bridge_stop_event.is_set() and poll_cycles < 25:
+            while not self._bridge_stop_event.is_set() and not self._bridge_sse_connected and poll_cycles < 5:
                 poll_cycles += 1
                 ok, data, dt_ping = self._bridge_poll_once()
                 self._bridge_last_ping_latency = dt_ping
                 if ok and isinstance(data, dict):
                     self._on_bridge_payload(data, "Polling", dt_ping)
-                    self._bridge_stop_event.wait(self._bridge_interval)
+                    self._bridge_stop_event.wait(1.6)
                 else:
                     self._bridge_consecutive_errors += 1
                     self._bridge_mode = "Fallback"
-                    if self._bridge_consecutive_errors == 5:
+                    if self._bridge_consecutive_errors >= 5:
                         self._bridge_interval = 3.0
-                        CLOG.log_warn("BRIDGE", "5 ошибок связи подряд! Переход в ступенчатый backoff на 3.0 секунды")
-                    elif self._bridge_consecutive_errors > 5:
-                        self._bridge_interval = 3.0
+                        if self._bridge_consecutive_errors == 5:
+                            CLOG.log_warn("BRIDGE", "5 ошибок связи подряд! Переход в backoff на 3.0 секунды")
+                    else:
+                        self._bridge_interval = 1.6
 
-                    # Резервный файл sync.json
                     fallback_data = self._read_fallback_sync_json()
                     with self._bridge_lock:
                         self._bridge_data = fallback_data
@@ -1352,6 +1404,8 @@ class ClawdPetPlugin(BasePlugin):
                     self._handler.removeCallbacks(self._karaoke_switch_r)
                 if self._auto_return_r is not None:
                     self._handler.removeCallbacks(self._auto_return_r)
+                if self._grad_anim_r is not None:
+                    self._handler.removeCallbacks(self._grad_anim_r)
             self._on_ui(self._stop_sensor)
             # Принудительный возврат съеденного при PAUSE
             self._on_ui(self._give_back)
@@ -1413,6 +1467,14 @@ class ClawdPetPlugin(BasePlugin):
                 subtext="LRCLIB + NetEase + архив Lyrics/ + кнопка выбора строки [📋]",
                 icon="msg_discussion",
                 on_change=lambda v: self._on_cfg_change("karaoke", v),
+            ),
+            Switch(
+                key="singing_mouth_enabled",
+                text="Анимация рта при пении",
+                default=False,
+                subtext="Открывать рот в ритм слов (по умолчанию выкл — только танец)",
+                icon="msg_voice",
+                on_change=lambda v: self._on_cfg_change("singing_mouth_enabled", v),
             ),
             Switch(
                 key="media_controls",
@@ -1748,6 +1810,7 @@ class ClawdPetPlugin(BasePlugin):
             "tg_events": bool(self.get_setting("tg_events", True)),
             "dance": bool(self.get_setting("dance", True)),
             "karaoke": bool(self.get_setting("karaoke", True)),
+            "singing_mouth_enabled": bool(self.get_setting("singing_mouth_enabled", False)),
             "media_controls": bool(self.get_setting("media_controls", True)),
             "battery_react": bool(self.get_setting("battery_react", True)),
             "clipboard_sync": bool(self.get_setting("clipboard_sync", False)),
@@ -1755,6 +1818,8 @@ class ClawdPetPlugin(BasePlugin):
             "poop": bool(self.get_setting("poop", True)),
             "shake": bool(self.get_setting("shake", True)),
         }
+        self._sync_offset_ms = 0.0
+        self._user_offset = 0.0
 
     def _on_cfg_change(self, key, value):
         self._cfg[key] = value
@@ -1870,19 +1935,6 @@ class ClawdPetPlugin(BasePlugin):
     def _build_views(self, context):
         self._update_metrics()
 
-        aura_view = View(context)
-        aura_view.setClickable(False)
-        aura_view.setFocusable(False)
-        aura_view.setVisibility(View.GONE)
-        aura_w = int(self._w * 1.38)
-        aura_h = int(self._h * 1.38)
-        self._decor.addView(aura_view, FrameLayout.LayoutParams(aura_w, aura_h))
-        self._aura_view = aura_view
-        self._last_aura_color = None
-        self._last_aura_x = None
-        self._last_aura_y = None
-        self._last_aura_visible = False
-
         pet = ImageView(context)
         pet.setScaleType(ImageView.ScaleType.FIT_XY)
         pet.setClickable(True)
@@ -1995,6 +2047,7 @@ class ClawdPetPlugin(BasePlugin):
         old_art = self._artwork_bmp
         self._artwork_bmp = None
         self._artwork_track_key = None
+        self._artwork_last_has_flag = False
         if old_art is not None:
             try:
                 old_art.recycle()
@@ -2008,11 +2061,11 @@ class ClawdPetPlugin(BasePlugin):
             self._remove_view(view)
         self._particles = []
         self._clear_artwork()
+        if self._handler is not None and self._grad_anim_r is not None:
+            self._handler.removeCallbacks(self._grad_anim_r)
         self._remove_view(self._laser_view)
         self._remove_view(self._bubble)
         self._remove_view(self._pet)
-        self._remove_view(self._aura_view)
-        self._aura_view = None
         self._pet = None
         self._bubble = None
         self._artwork_row = None
@@ -2029,11 +2082,10 @@ class ClawdPetPlugin(BasePlugin):
         self._platform = None
         self._platforms = []
         self._bubble_mode = None
-        self._last_bubble_accent = None
-        self._last_aura_color = None
-        self._last_aura_x = None
-        self._last_aura_y = None
-        self._last_aura_visible = False
+        self._last_bubble_palette = None
+        self._karaoke_border_gd = None
+        self._karaoke_bg_gd = None
+        self._karaoke_layer_drawable = None
         self._last_rendered_bmp = None
         self._last_rendered_frame_key = None
         for bmp in list(self._frames.values()):
@@ -2101,13 +2153,6 @@ class ClawdPetPlugin(BasePlugin):
         lp.width = self._w
         lp.height = self._h
         self._pet.setLayoutParams(lp)
-        if self._aura_view is not None:
-            alp = self._aura_view.getLayoutParams()
-            alp.width = int(self._w * 1.38)
-            alp.height = int(self._h * 1.38)
-            self._aura_view.setLayoutParams(alp)
-            self._last_aura_x = None
-            self._last_aura_y = None
         self._hop(self._dp(300))
         self._schedule(16)
 
@@ -2414,11 +2459,21 @@ class ClawdPetPlugin(BasePlugin):
         self._next_peek = now + PEEK_AFTER
         self._is_singing = False
         self._current_lyric_idx = -1
+        self._anchor_pos_ms = 0.0
+        self._anchor_mono = 0.0
+        self._anchor_speed = 1.0
+        self._sync_offset_ms = 0.0
         self._track_base_pos = 0.0
         self._track_base_time = 0.0
         self._track_is_playing = False
         self._playback_speed = 1.0
         self._accent_color = None
+        self._target_palette = DEFAULT_KARAOKE_PALETTE
+        self._grad_curr = DEFAULT_KARAOKE_PALETTE
+        self._grad_from = DEFAULT_KARAOKE_PALETTE
+        self._grad_target = DEFAULT_KARAOKE_PALETTE
+        self._last_processed_bridge_rx_mono = 0.0
+        self._artwork_last_has_flag = False
         self._user_offset = 0.0
         self._position_known = True
 
@@ -3321,7 +3376,7 @@ class ClawdPetPlugin(BasePlugin):
             eyes = "blink"
 
         if state != "sleep":
-            if self._is_singing:
+            if self._is_singing and self._cfg.get("singing_mouth_enabled", False):
                 mouth = "open" if int(now * 7) % 2 else "chew"
             elif now < self._mouth_open_until:
                 mouth = "open"
@@ -3376,35 +3431,6 @@ class ClawdPetPlugin(BasePlugin):
         if self._last_rendered_rot != rotation:
             self._last_rendered_rot = rotation
             self._pet.setRotation(float(rotation))
-
-        if self._aura_view is not None:
-            show_aura = self._media == "music" and self._accent_color is not None and self._state != "sleep"
-            if show_aura:
-                if not self._last_aura_visible:
-                    self._last_aura_visible = True
-                    self._aura_view.setVisibility(View.VISIBLE)
-                if self._last_aura_color != self._accent_color:
-                    self._last_aura_color = self._accent_color
-                    rgb = self._accent_color & 0x00FFFFFF
-                    agd = GradientDrawable()
-                    agd.setShape(GradientDrawable.OVAL)
-                    agd.setColor(as_java_color(rgb | 0x33000000))
-                    agd.setStroke(max(1, int(self._dp(2))), as_java_color(rgb | 0x88000000))
-                    self._aura_view.setBackground(agd)
-                ax = cur_x - (self._w * 0.19)
-                ay = cur_y - (self._h * 0.19)
-                if self._last_aura_x != ax:
-                    self._last_aura_x = ax
-                    self._aura_view.setTranslationX(float(ax))
-                if self._last_aura_y != ay:
-                    self._last_aura_y = ay
-                    self._aura_view.setTranslationY(float(ay))
-                pulse = 1.0 + (0.06 * abs(math.sin(now * math.pi * 2.0)) if self._track_is_playing else 0.0)
-                self._aura_view.setScaleX(float(pulse))
-                self._aura_view.setScaleY(float(pulse))
-            elif self._last_aura_visible:
-                self._last_aura_visible = False
-                self._aura_view.setVisibility(View.GONE)
 
     def _restore_position(self, min_x, max_x, min_y, max_y):
         fx = self.get_setting("pos_x", None)
@@ -3815,10 +3841,89 @@ class ClawdPetPlugin(BasePlugin):
                 self._say("sent")
         self._schedule(0)
 
+    def _clear_playback_anchors(self, reset_user_offset: bool = False):
+        self._anchor_pos_ms = 0.0
+        self._anchor_mono = 0.0
+        self._anchor_speed = 1.0
+        self._track_base_pos = 0.0
+        self._track_base_time = 0.0
+        self._track_is_playing = False
+        self._playback_speed = 1.0
+        self._last_sse_rx_mono = 0.0
+        self._last_processed_bridge_rx_mono = 0.0
+        self._current_lyric_idx = -1
+        self._is_singing = False
+        if reset_user_offset:
+            self._sync_offset_ms = 0.0
+            self._user_offset = 0.0
+            self._session_offsets.clear()
+
+    def _get_current_track_pos_ms(self, now: Optional[float] = None) -> float:
+        if now is None:
+            now = time.monotonic()
+        if not self._track_is_playing or self._anchor_mono <= 0.0:
+            return self._anchor_pos_ms
+        return self._anchor_pos_ms + max(0.0, now - self._anchor_mono) * 1000.0 * self._anchor_speed
+
     def _get_current_track_pos(self, now: float) -> float:
-        if not self._track_is_playing or self._track_base_time == 0.0:
-            return self._track_base_pos
-        return self._track_base_pos + max(0.0, now - self._track_base_time) * self._playback_speed
+        return self._get_current_track_pos_ms(now) / 1000.0
+
+    def _apply_fresh_bridge_anchor_and_jump(self, expected_track_id: str):
+        """После загрузки LRC берёт живой якорь из SSE или свежего GET /now-playing (без старого пре-LRC якоря)."""
+        with self._bridge_lock:
+            snap = self._bridge_data
+        now = time.monotonic()
+        if snap and snap.get("has_media") and snap.get("is_playing"):
+            rx_mono = float(snap.get("_received_mono") or 0.0)
+            if rx_mono > 0.0 and (self._bridge_sse_connected or (now - rx_mono <= 0.45)):
+                pos_ms = float(snap.get("position_ms") or 0.0)
+                try:
+                    spd = clamp(float(snap.get("playback_speed") or 1.0), 0.25, 4.0)
+                except Exception:
+                    spd = 1.0
+                self._anchor_pos_ms = pos_ms
+                self._anchor_mono = rx_mono
+                self._anchor_speed = spd
+                self._playback_speed = spd
+                self._track_base_pos = pos_ms / 1000.0
+                self._track_base_time = rx_mono
+                self._last_processed_bridge_rx_mono = max(self._last_processed_bridge_rx_mono, rx_mono)
+                self._current_lyric_idx = -1
+                self._do_karaoke_line_switch()
+                return
+
+        self._current_lyric_idx = -1
+        self._do_karaoke_line_switch()
+
+        if not self._bridge_sse_connected:
+            def _fetch_now():
+                ok, data, dt_ping = self._bridge_poll_once()
+                if not ok or not isinstance(data, dict) or not data.get("has_media") or not data.get("is_playing"):
+                    return
+                self._on_bridge_payload(data, "Polling", dt_ping)
+                rx_fresh = time.monotonic()
+                pos_fresh = float(data.get("position_ms") or 0.0)
+                try:
+                    spd_fresh = clamp(float(data.get("playback_speed") or 1.0), 0.25, 4.0)
+                except Exception:
+                    spd_fresh = 1.0
+
+                def _apply_live():
+                    if self._unloaded or self._current_track_id != expected_track_id:
+                        return
+                    self._anchor_pos_ms = pos_fresh
+                    self._anchor_mono = rx_fresh
+                    self._anchor_speed = spd_fresh
+                    self._playback_speed = spd_fresh
+                    self._track_base_pos = pos_fresh / 1000.0
+                    self._track_base_time = rx_fresh
+                    self._last_processed_bridge_rx_mono = max(self._last_processed_bridge_rx_mono, rx_fresh)
+                    self._current_lyric_idx = -1
+                    self._do_karaoke_line_switch()
+
+                run_on_ui_thread(_apply_live)
+
+            threading.Thread(target=_fetch_now, daemon=True, name="clawd_lrc_sync_snap").start()
 
     def _fetch_artwork_async(self, expected_track_id: str, track_label: str):
         def _worker():
@@ -3883,6 +3988,7 @@ class ClawdPetPlugin(BasePlugin):
         playback_speed = 1.0
         bridge_rx_mono = 0.0
         accent_color: Optional[int] = None
+        palette_3: Tuple[int, int, int] = DEFAULT_KARAOKE_PALETTE
         has_artwork = False
 
         # Проверка окончания тестового режима караоке и приоритета реального воспроизведения
@@ -3921,7 +4027,7 @@ class ClawdPetPlugin(BasePlugin):
                 test_done = True
             elif self._lyrics_timeline and self._get_current_track_pos(now) > self._lyrics_timeline[-1][0] + 6.0:
                 test_done = True
-            elif not self._lyrics_timeline and self._track_base_time > 0.0 and (now - self._track_base_time > 10.0):
+            elif not self._lyrics_timeline and self._anchor_mono > 0.0 and (now - self._anchor_mono > 10.0):
                 test_done = True
             if not test_done:
                 self._track_is_playing = True
@@ -3950,6 +4056,7 @@ class ClawdPetPlugin(BasePlugin):
                         playback_speed = 1.0
                     bridge_rx_mono = float(bridge_snapshot.get("_received_mono") or 0.0)
                     accent_color = parse_hex_color(bridge_snapshot.get("accent_color"))
+                    palette_3 = derive_palette_3(bridge_snapshot.get("accent_color"), bridge_snapshot.get("accent_colors"))
                     has_artwork = bool(bridge_snapshot.get("has_artwork", False))
                 elif tg_paused_music is not None:
                     kind = "music"
@@ -3978,51 +4085,49 @@ class ClawdPetPlugin(BasePlugin):
                         playback_speed = 1.0
                     bridge_rx_mono = float(bridge_snapshot.get("_received_mono") or 0.0)
                     accent_color = parse_hex_color(bridge_snapshot.get("accent_color"))
+                    palette_3 = derive_palette_3(bridge_snapshot.get("accent_color"), bridge_snapshot.get("accent_colors"))
                     has_artwork = bool(bridge_snapshot.get("has_artwork", False))
 
         if kind == "music":
-            if self._accent_color != accent_color:
-                self._accent_color = accent_color
+            self._accent_color = accent_color
+            if self._target_palette != palette_3:
+                self._target_palette = palette_3
                 if self._bubble_visible and self._bubble_mode == "karaoke":
                     self._apply_karaoke_bubble_style()
         else:
             self._accent_color = None
+            self._target_palette = DEFAULT_KARAOKE_PALETTE
 
+        track_changed = False
         if track_title:
             clean_a, clean_t = self._lyrics_helper.clean_metadata(track_artist, track_title)
             self._last_active_clean_a = clean_a
             self._last_active_clean_t = clean_t
-            # Смена трека фиксируется строго по тройке (player, artist, title)
             triplet_id = f"{player_name}::{clean_a}::{clean_t}"
             art_key = f"{clean_a}::{clean_t}"
             if triplet_id != self._current_track_id:
+                track_changed = True
                 self._current_track_id = triplet_id
                 self._lyrics_timeline = []
-                self._current_lyric_idx = -1
-                self._is_singing = False
+                self._clear_playback_anchors(reset_user_offset=False)
                 self._lyrics_retry_count = 0
                 self._last_lyrics_retry = 0.0
                 self._clear_artwork()
 
-                # Из памяти сессии извлекается сохранённый сдвиг _user_offset для данного трека
                 track_offset_key = f"{clean_a} - {clean_t}"
                 self._user_offset = self._session_offsets.get(track_offset_key, 0.0)
+                self._sync_offset_ms = self._user_offset * 1000.0
 
                 CLOG.log_info(
                     "TRACK",
-                    f"Смена трека: '{clean_a}' — '{clean_t}' (player={player_name}, speed={playback_speed:.2f}x, offset={self._user_offset:.3f}с)",
+                    f"Смена трека: '{clean_a}' — '{clean_t}' (player={player_name}, speed={playback_speed:.2f}x, offset={self._sync_offset_ms:.0f}мс)",
                     player=player_name,
                     artist=clean_a,
                     title=clean_t,
-                    offset=f"{self._user_offset:.3f}",
+                    offset_ms=f"{self._sync_offset_ms:.0f}",
                 )
 
-                if used_bridge and has_artwork and self._artwork_track_key != art_key:
-                    self._artwork_track_key = art_key
-                    label = f"{clean_a} — {clean_t}" if clean_a else clean_t
-                    self._fetch_artwork_async(triplet_id, label)
-
-                # Треки без автора длительностью < 30 с считаются рекламой
+                # Реклама: без автора и < 30 с
                 is_ad = (not clean_a) and (0 < duration_ms < 30000)
                 if is_ad:
                     CLOG.log_info("TRACK", "Обнаружена реклама: пропуск поиска слов")
@@ -4037,12 +4142,12 @@ class ClawdPetPlugin(BasePlugin):
                             self._lyrics_timeline = tl
                             if not tl:
                                 self._say("no_lyrics")
-                            self._reschedule_karaoke_switch()
+                                return
+                            self._apply_fresh_bridge_anchor_and_jump(expected_track_id)
                         run_on_ui_thread(_apply)
 
                     self._lyrics_helper.get_lyrics_async(clean_a, clean_t, _on_lyrics_loaded)
 
-            # 2.2 Автоматический повтор (Soft Auto-Retry), если трек играет, но слова ещё не найдены
             elif kind == "music" and is_playing and not self._lyrics_timeline and (clean_a or clean_t):
                 if self._lyrics_retry_count < 3 and (now - self._last_lyrics_retry >= 6.0):
                     self._lyrics_retry_count += 1
@@ -4062,73 +4167,104 @@ class ClawdPetPlugin(BasePlugin):
                                 return
                             if tl:
                                 self._lyrics_timeline = tl
-                                self._reschedule_karaoke_switch()
+                                self._apply_fresh_bridge_anchor_and_jump(expected_track_id)
                             elif self._lyrics_retry_count >= 3:
                                 self._say("no_lyrics")
                         run_on_ui_thread(_apply_retry)
 
                     self._lyrics_helper.get_lyrics_async(clean_a, clean_t, _on_retry_loaded)
 
-        # 2.2 Математика синхронизации и сдвига (с учётом playback_speed и времени доставки SSE)
+            # Обложка: запрашивается ОДИН раз при смене трека ИЛИ при изменении has_artwork: False -> True
+            if used_bridge:
+                should_fetch_art = has_artwork and (
+                    self._artwork_track_key != art_key or not self._artwork_last_has_flag
+                )
+                self._artwork_last_has_flag = has_artwork
+                if should_fetch_art:
+                    self._artwork_track_key = art_key
+                    label = f"{clean_a} — {clean_t}" if clean_a else clean_t
+                    self._fetch_artwork_async(triplet_id, label)
+
+        # Монотонный якорь + 3-уровневая анти-дрейфовая коррекция на чекпоинтах Bridge
         self._position_known = position_known
         if kind == "music":
-            # 1.2 Компенсация задержки передачи моста: Δ_comp = 0.22 с
-            if used_bridge:
-                t_new = (track_position_ms / 1000.0) + 0.22
-                if is_playing and bridge_rx_mono > 0.0:
-                    t_new += max(0.0, now - bridge_rx_mono) * playback_speed
-            else:
-                t_new = track_position_ms / 1000.0
-            t_calc = self._get_current_track_pos(now)
-            drift = abs(t_new - t_calc)
-            speed_changed = abs(playback_speed - self._playback_speed) > 0.01
-            sse_fresh_event = bool(
-                used_bridge
-                and bridge_snapshot is not None
-                and bridge_snapshot.get("_is_sse_event")
-                and bridge_rx_mono > 0.0
-                and bridge_rx_mono != self._last_sse_rx_mono
-            )
-            if sse_fresh_event:
-                self._last_sse_rx_mono = bridge_rx_mono
-
-            # 1.2 Отслеживание перехода пауза -> возобновление (resumed)
             was_paused = not self._track_is_playing
             resumed = is_playing and was_paused
+            speed_changed = abs(playback_speed - self._anchor_speed) > 0.01
 
             if not is_playing:
-                # Пауза: значение T_calc замораживается на месте
+                fresh_pause_pkt = used_bridge and bridge_rx_mono > self._last_processed_bridge_rx_mono
+                if fresh_pause_pkt:
+                    self._last_processed_bridge_rx_mono = bridge_rx_mono
+                    self._anchor_pos_ms = float(track_position_ms)
+                else:
+                    self._anchor_pos_ms = self._get_current_track_pos_ms(now)
+                self._anchor_mono = 0.0
+                self._anchor_speed = playback_speed
+                self._playback_speed = playback_speed
+                self._track_base_pos = self._anchor_pos_ms / 1000.0
+                self._track_base_time = 0.0
                 self._track_is_playing = False
                 self._is_singing = False
-                self._playback_speed = playback_speed
-                self._track_base_pos = t_calc
-                self._track_base_time = now
                 if self._handler and self._karaoke_switch_r:
                     self._handler.removeCallbacks(self._karaoke_switch_r)
             else:
                 self._track_is_playing = True
                 self._playback_speed = playback_speed
-                # База времени пересчитывается строго при:
-                # 1) Реальной ручной перемотке трека пользователем: drift > 1.2;
-                # 2) Первичном старте трека: _track_base_time == 0.0;
-                # 3) Возобновлении воспроизведения после паузы: resumed == True;
-                # 4) Изменении скорости воспроизведения или свежем SSE-событии (смена/перемотка).
-                if drift > 1.2 or self._track_base_time == 0.0 or resumed or speed_changed or sse_fresh_event:
-                    CLOG.log_debug(
-                        "JITTER",
-                        f"Обновление базы: drift={drift*1000:.0f}мс resumed={resumed} sse={sse_fresh_event} speed={playback_speed:.2f}x",
-                        drift_ms=f"{drift*1000:.0f}",
-                        resumed=resumed,
-                    )
-                    self._track_base_pos = t_new
-                    self._track_base_time = now
-                    # Немедленный перерасчет таймера караоке
-                    if resumed or self._bubble_mode != "karaoke":
-                        self._current_lyric_idx = -1
-                    if resumed or sse_fresh_event:
+
+                if used_bridge:
+                    fresh_pkt = bridge_rx_mono > self._last_processed_bridge_rx_mono
+                    if fresh_pkt or track_changed or resumed or self._anchor_mono <= 0.0:
+                        if fresh_pkt:
+                            self._last_processed_bridge_rx_mono = bridge_rx_mono
+                        pkt_mono = bridge_rx_mono if bridge_rx_mono > 0.0 else now
+
+                        if track_changed or resumed or self._anchor_mono <= 0.0 or speed_changed:
+                            self._anchor_pos_ms = float(track_position_ms)
+                            self._anchor_mono = pkt_mono
+                            self._anchor_speed = playback_speed
+                            self._track_base_pos = self._anchor_pos_ms / 1000.0
+                            self._track_base_time = pkt_mono
+                            self._current_lyric_idx = -1
+                            self._do_karaoke_line_switch()
+                        else:
+                            # Анти-дрейф на 2-секундных чекпоинтах строго в момент получения пакета
+                            local_at_rx_ms = self._anchor_pos_ms + max(0.0, pkt_mono - self._anchor_mono) * 1000.0 * self._anchor_speed
+                            delta = float(track_position_ms) - local_at_rx_ms
+                            if abs(delta) >= 180.0:
+                                CLOG.log_debug(
+                                    "ANTIDRIFT",
+                                    f"Мгновенный снап якоря: delta={delta:+.0f}мс",
+                                    delta_ms=f"{delta:.0f}",
+                                )
+                                self._anchor_pos_ms = float(track_position_ms)
+                                self._anchor_mono = pkt_mono
+                                self._anchor_speed = playback_speed
+                                self._track_base_pos = self._anchor_pos_ms / 1000.0
+                                self._track_base_time = pkt_mono
+                                self._do_karaoke_line_switch()
+                            elif abs(delta) > 50.0:
+                                CLOG.log_debug(
+                                    "ANTIDRIFT",
+                                    f"Мягкая коррекция якоря: delta={delta:+.0f}мс (сдвиг {delta*0.5:+.0f}мс)",
+                                    delta_ms=f"{delta:.0f}",
+                                )
+                                self._anchor_pos_ms += delta * 0.5
+                                self._track_base_pos = self._anchor_pos_ms / 1000.0
+                                self._reschedule_karaoke_switch()
+                else:
+                    # Telegram MediaController (нет SSE-пакетов)
+                    local_ms = self._get_current_track_pos_ms(now)
+                    delta = float(track_position_ms) - local_ms
+                    if track_changed or resumed or self._anchor_mono <= 0.0 or speed_changed or abs(delta) >= 180.0:
+                        self._anchor_pos_ms = float(track_position_ms)
+                        self._anchor_mono = now
+                        self._anchor_speed = playback_speed
+                        self._track_base_pos = self._anchor_pos_ms / 1000.0
+                        self._track_base_time = now
+                        if resumed or self._bubble_mode != "karaoke" or abs(delta) >= 180.0:
+                            self._current_lyric_idx = -1
                         self._do_karaoke_line_switch()
-                    else:
-                        self._reschedule_karaoke_switch()
         else:
             self._track_is_playing = False
             self._playback_speed = 1.0
@@ -4138,15 +4274,12 @@ class ClawdPetPlugin(BasePlugin):
         prev = self._media
         self._media = kind
         if kind is None:
-            self._is_singing = False
             self._current_track_id = None
             self._lyrics_timeline = []
-            self._current_lyric_idx = -1
             self._lyrics_retry_count = 0
-            self._track_base_pos = 0.0
-            self._track_base_time = 0.0
-            self._playback_speed = 1.0
+            self._clear_playback_anchors(reset_user_offset=False)
             self._accent_color = None
+            self._target_palette = DEFAULT_KARAOKE_PALETTE
             self._clear_artwork()
             self._hide_bubble()
             if self._handler and self._karaoke_switch_r:
@@ -4181,7 +4314,7 @@ class ClawdPetPlugin(BasePlugin):
         t_calc_raw = self._get_current_track_pos(now)
         t_karaoke = t_calc_raw + self._user_offset
 
-        # Находим текущую строку и следующую
+        # Находим текущую строку (последняя строка с line_time_ms <= current_pos_ms) и следующую
         cur_idx = -1
         next_idx = -1
         for i, (t_sec, _) in enumerate(self._lyrics_timeline):
@@ -4191,38 +4324,30 @@ class ClawdPetPlugin(BasePlugin):
                 next_idx = i
                 break
 
-        # 1.3 Устранение зависания рта и строки на инструментальных паузах
         wake_at = t_karaoke + 0.35
         if cur_idx >= 0:
             t_curr = self._lyrics_timeline[cur_idx][0]
             if next_idx >= 0:
                 t_next_line = self._lyrics_timeline[next_idx][0]
                 line_dur = t_next_line - t_curr
-                # Если длительность строки > 5.5 с: sing_until = T_curr + min(line_dur - 0.7, 5.0)
-                # Иначе: sing_until = T_next_line
                 sing_until = t_curr + min(line_dur - 0.7, 5.0) if line_dur > 5.5 else t_next_line
 
-                # Точка следующего пробуждения таймера (wake_at):
                 if t_karaoke < sing_until:
-                    # Строка ещё поётся: цель — закрыть рот и скрыть облачко вовремя
                     wake_at = sing_until
                 else:
-                    # Строка уже спета, но следующая ещё не началась (инструментальный проигрыш)
                     wake_at = t_next_line
             else:
-                # Трек закончился / последняя строка
                 sing_until = t_curr + 5.0
                 if t_karaoke < sing_until:
                     wake_at = sing_until
                 else:
                     wake_at = t_karaoke + 4.0
         elif next_idx >= 0:
-            # До начала первой вокальной партии (интро)
             wake_at = self._lyrics_timeline[next_idx][0]
         else:
             wake_at = t_karaoke + 4.0
 
-        speed = max(0.25, self._playback_speed)
+        speed = max(0.25, self._anchor_speed if self._anchor_mono > 0.0 else self._playback_speed)
         delay_ms = max(30, int(((wake_at - t_karaoke) / speed) * 1000.0))
         self._handler.postDelayed(self._karaoke_switch_r, delay_ms)
 
@@ -4239,14 +4364,13 @@ class ClawdPetPlugin(BasePlugin):
             self._is_singing = False
             return
 
-        # 1.1 Защита от смерти караоке-петли при прыжке, перетаскивании или тапе
+        # Защита от смерти караоке-петли при прыжке, перетаскивании или тапе
         if self._state not in ("idle", "walk"):
             self._is_singing = False
             if self._handler and self._karaoke_switch_r:
                 self._handler.postDelayed(self._karaoke_switch_r, 100)
             return
 
-        # 2.2 Если position_known == False
         if not self._position_known:
             self._is_singing = False
             self._say("sync_unavailable")
@@ -4278,7 +4402,6 @@ class ClawdPetPlugin(BasePlugin):
                     self._show_karaoke_line(cur_line, next_line, now)
             else:
                 self._is_singing = False
-                # Во время воспроизведения трека темная плашка караоке НЕ скрывается на микро-паузах или проигрышах
                 if self._track_is_playing and bool(self._lyrics_timeline):
                     if self._current_lyric_idx != -2:
                         self._current_lyric_idx = -2
@@ -4287,6 +4410,12 @@ class ClawdPetPlugin(BasePlugin):
                     if self._current_lyric_idx != -2:
                         self._current_lyric_idx = -2
                         self._hide_bubble()
+        else:
+            self._is_singing = False
+            if self._current_lyric_idx != -1:
+                self._current_lyric_idx = -1
+                if self._track_is_playing and self._lyrics_timeline:
+                    self._show_karaoke_line("♪ ♪ ♪", self._lyrics_timeline[0][1], now)
 
         self._reschedule_karaoke_switch()
 
@@ -4332,32 +4461,98 @@ class ClawdPetPlugin(BasePlugin):
             view.setTranslationY(0.0)
             view.setAlpha(target_alpha)
 
+    def _apply_palette_to_drawables(self, palette: Tuple[int, int, int]):
+        if self._bubble is None:
+            return
+        border_cols = jarray(jint)([as_java_color((c & 0x00FFFFFF) | 0xDD000000) for c in palette])
+        bg_cols = jarray(jint)([as_java_color((mix_color(0xFF0D0E12, c, 0.19) & 0x00FFFFFF) | 0xEA000000) for c in palette])
+        stroke_px = max(2, int(self._dp(1.8)))
+        radius_px = float(self._dp(13))
+
+        if (
+            self._karaoke_layer_drawable is not None
+            and self._karaoke_border_gd is not None
+            and self._karaoke_bg_gd is not None
+        ):
+            try:
+                self._karaoke_border_gd.setColors(border_cols)
+                self._karaoke_bg_gd.setColors(bg_cols)
+                if self._bubble.getBackground() is not self._karaoke_layer_drawable:
+                    self._bubble.setBackground(self._karaoke_layer_drawable)
+                self._bubble.invalidate()
+                return
+            except Exception:
+                pass
+
+        border_gd = GradientDrawable(GradientDrawable.Orientation.TL_BR, border_cols)
+        border_gd.setCornerRadius(radius_px)
+        bg_gd = GradientDrawable(GradientDrawable.Orientation.TL_BR, bg_cols)
+        bg_gd.setCornerRadius(max(1.0, radius_px - stroke_px))
+
+        ld = LayerDrawable([border_gd, bg_gd])
+        ld.setLayerInset(1, stroke_px, stroke_px, stroke_px, stroke_px)
+        self._karaoke_border_gd = border_gd
+        self._karaoke_bg_gd = bg_gd
+        self._karaoke_layer_drawable = ld
+        self._bubble.setBackground(ld)
+        pad12 = int(self._dp(12))
+        pad7 = int(self._dp(7))
+        self._bubble.setPadding(pad12, pad7, pad12, pad7)
+
+    def _step_gradient_anim(self):
+        if self._unloaded or self._paused or self._bubble is None or self._bubble_mode != "karaoke":
+            return
+        elapsed = time.monotonic() - self._grad_anim_start
+        dur = 0.36
+        t = clamp(elapsed / dur, 0.0, 1.0)
+        eased = 1.0 - (1.0 - t) * (1.0 - t)
+        cur = (
+            mix_color(self._grad_from[0], self._grad_target[0], eased),
+            mix_color(self._grad_from[1], self._grad_target[1], eased),
+            mix_color(self._grad_from[2], self._grad_target[2], eased),
+        )
+        self._grad_curr = cur
+        self._apply_palette_to_drawables(cur)
+        if t < 1.0 and self._handler is not None and self._grad_anim_r is not None:
+            self._handler.postDelayed(self._grad_anim_r, 16)
+
     def _apply_karaoke_bubble_style(self):
         if self._bubble is None:
             return
-        self._last_bubble_accent = self._accent_color
-        bg = GradientDrawable()
-        bg.setCornerRadius(float(self._dp(13)))
-        if self._accent_color is not None:
-            tinted = (mix_color(0xFF1A1A1E, self._accent_color, 0.16) & 0x00FFFFFF) | 0xEE000000
-            stroke_c = (self._accent_color & 0x00FFFFFF) | 0xCC000000
-            bg.setColor(as_java_color(tinted))
-            bg.setStroke(max(1, int(self._dp(1.5))), as_java_color(stroke_c))
+        target = self._target_palette or DEFAULT_KARAOKE_PALETTE
+        self._last_bubble_palette = target
+
+        if (
+            self._bubble_visible
+            and self._bubble_mode == "karaoke"
+            and self._karaoke_layer_drawable is not None
+            and self._handler is not None
+            and self._grad_anim_r is not None
+            and self._grad_curr != target
+        ):
+            self._handler.removeCallbacks(self._grad_anim_r)
+            self._grad_from = self._grad_curr
+            self._grad_target = target
+            self._grad_anim_start = time.monotonic()
+            self._step_gradient_anim()
         else:
-            bg.setColor(as_java_color(0xEE1A1A1E))
-            bg.setStroke(max(1, int(self._dp(1))), as_java_color(0x33FFFFFF))
-        self._bubble.setBackground(bg)
+            if self._handler is not None and self._grad_anim_r is not None:
+                self._handler.removeCallbacks(self._grad_anim_r)
+            self._grad_curr = target
+            self._grad_from = target
+            self._grad_target = target
+            self._apply_palette_to_drawables(target)
 
     def _show_karaoke_line(self, current_text: str, next_text: str, now: float):
         if self._bubble is None or self._bubble_text is None:
             return
         try:
-            if self._bubble_mode != "karaoke" or self._last_bubble_accent != self._accent_color:
+            if self._bubble_mode != "karaoke" or self._last_bubble_palette != self._target_palette:
                 self._apply_karaoke_bubble_style()
             if self._bubble_mode != "karaoke":
                 self._bubble_mode = "karaoke"
 
-                # 2.2 Стабилизация караоке-виджета: фиксированная геометрия 210-260 dp
+                # Стабилизация караоке-виджета: фиксированная геометрия 210-260 dp
                 self._bubble.setMinimumWidth(AndroidUtilities.dp(210))
                 pad12 = int(self._dp(12))
                 pad7 = int(self._dp(7))
@@ -4379,7 +4574,6 @@ class ClawdPetPlugin(BasePlugin):
             self._bubble_text.setTextColor(as_java_color(0xFFFFFFFF))
             self._animate_text_change(self._bubble_text, current_text, target_alpha=1.0)
 
-            # Фиксированная высота в две строки: нижняя строка на 45% alpha или невидимая заглушка фиксированной высоты
             if self._bubble_subtext is not None:
                 self._bubble_subtext.setVisibility(View.VISIBLE)
                 if next_text:
@@ -4425,8 +4619,8 @@ class ClawdPetPlugin(BasePlugin):
                     # Формула: _user_offset = T_line - T_calc_raw
                     new_offset = t_line - t_calc_raw
                     self._user_offset = new_offset
+                    self._sync_offset_ms = new_offset * 1000.0
 
-                    # 1.4 Сохраняем в память сессии по нормализованному ключу f"{clean_a} - {clean_t}"
                     clean_a = getattr(self, "_last_active_clean_a", "")
                     clean_t = getattr(self, "_last_active_clean_t", "")
                     if not clean_t and self._current_track_id:
@@ -4459,17 +4653,21 @@ class ClawdPetPlugin(BasePlugin):
         track_id = f"custom::{a}::{t}"
         if track_id == self._current_track_id and self._is_singing:
             return
+        now = time.monotonic()
         self._current_track_id = track_id
         self._lyrics_timeline = []
-        self._current_lyric_idx = -1
-        self._is_singing = False
+        self._clear_playback_anchors(reset_user_offset=False)
         self._media = "music"
         self._track_is_playing = True
+        self._anchor_pos_ms = 0.0
+        self._anchor_mono = now
+        self._anchor_speed = 1.0
         self._track_base_pos = 0.0
-        self._track_base_time = time.monotonic()
+        self._track_base_time = now
         self._lyrics_retry_count = 0
         self._last_lyrics_retry = 0.0
         self._user_offset = self._session_offsets.get(f"{a} - {t}", 0.0)
+        self._sync_offset_ms = self._user_offset * 1000.0
 
         self._say_track_detected(a, t)
         expected_track_id = track_id
@@ -4509,6 +4707,8 @@ class ClawdPetPlugin(BasePlugin):
 
         try:
             self._bubble_gen += 1
+            if self._handler is not None and self._grad_anim_r is not None:
+                self._handler.removeCallbacks(self._grad_anim_r)
             self._bubble.animate().cancel()
             if self._bubble_text is not None:
                 self._bubble_text.animate().cancel()
@@ -4560,6 +4760,8 @@ class ClawdPetPlugin(BasePlugin):
     def _hide_bubble(self):
         if self._bubble is None or not self._bubble_visible:
             return
+        if self._handler is not None and self._grad_anim_r is not None:
+            self._handler.removeCallbacks(self._grad_anim_r)
         self._bubble_visible = False
         self._bubble_fade_in = False
         self._bubble_gen += 1
@@ -4626,7 +4828,6 @@ class ClawdPetPlugin(BasePlugin):
             if (
                 view.equals(self._pet)
                 or view.equals(self._bubble)
-                or (self._aura_view is not None and view.equals(self._aura_view))
                 or (self._laser_view is not None and view.equals(self._laser_view))
             ):
                 continue
