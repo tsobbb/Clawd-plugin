@@ -160,12 +160,13 @@ test('Clawd v3.5 satisfies all requirements from ТЗ v3.5', () => {
     '2.1: В _say() минимальная ширина сбрасывается в 0'
   );
   assert.ok(
+    code.includes('self._bubble.setMinimumWidth(min_w)') ||
     code.includes('self._bubble.setMinimumWidth(AndroidUtilities.dp(210.0 * s))') ||
     code.includes('self._bubble.setMinimumWidth(AndroidUtilities.dp(210))'),
-    '2.2: В _show_karaoke_line минимальная ширина фиксируется на 210dp (с поддержкой bubble_scale)'
+    '2.2: В _show_karaoke_line минимальная ширина задается динамически с учётом bubble_scale'
   );
   assert.ok(
-    code.includes('setMaxWidth(AndroidUtilities.dp(260.0 * s))') ||
+    code.includes('AndroidUtilities.dp(260.0 * s)') ||
     code.includes('setMaxWidth(AndroidUtilities.dp(260))'),
     '2.2: Максимальная ширина текста 260dp (с поддержкой bubble_scale)'
   );
@@ -313,7 +314,8 @@ test('Clawd Bridge v2.1: Telegram artwork/accents, animated gradient toggle, DM 
 
   // 5. Rational connected headphones (no air gap, cached with music_phones, avoids clobbering full hats)
   assert.ok(
-    code.includes('music_phones = bool(self._media == "music" and self._track_is_playing and state != "sleep")') &&
+    (code.includes('music_phones = bool(self._cfg.get("dance", True) and self._media == "music" and self._track_is_playing and not self._paused and state != "sleep")') ||
+     code.includes('music_phones = bool(self._media == "music" and self._track_is_playing and state != "sleep")')) &&
     code.includes('if "Наушники DJ" in hat or (music_phones and ("Без шапки" in hat or "Очки Thug" in hat)):') &&
     code.includes('px(left + 1, top - 1, right - 1, top, band_c)'),
     '5. Connected headphone headband at top-1, music_phones cache key, and hat-preserving condition required'
@@ -328,4 +330,75 @@ test('Clawd Bridge v2.1: Telegram artwork/accents, animated gradient toggle, DM 
     '6. bubble_scale 0.4x-2.0x dialog and geometry scaling required'
   );
 });
+
+test('Clawd v3.5.1: blue headphones reset on stop/disable, dynamic scale relayout, and standalone synced lyrics-only plugin', () => {
+  const petPath = path.resolve(process.cwd(), 'public/clawd_v3_4.py');
+  const lyricsPath = path.resolve(process.cwd(), 'public/clawd_lyrics_player.py');
+  const petCode = fs.readFileSync(petPath, 'utf-8');
+  const lyricsCode = fs.readFileSync(lyricsPath, 'utf-8');
+
+  // 1. Blue headphones never stick when music/settings/bridge are off
+  assert.ok(
+    petCode.includes('has_media = bool(d.get("has_media", True))') &&
+    petCode.includes('is_playing = bool(d.get("is_playing", True))') &&
+    petCode.includes('(now - b_rx_chk) > 4.0') &&
+    petCode.includes('elif key == "dance" and not value:') &&
+    petCode.includes('music_phones = bool(self._cfg.get("dance", True) and self._media == "music" and self._track_is_playing and not self._paused and state != "sleep")'),
+    '1. Blue headphones must expire on stale bridge, respect sync.json flags, and reset immediately on dance=False'
+  );
+
+  // 2. Dynamic bubble scale recalculation without old-text/old-size layout bloat
+  assert.ok(
+    petCode.includes('def _relayout_bubble(self):') &&
+    petCode.includes('base_min = 210.0 if abs(s - 1.0) < 0.01 else 110.0 * s') &&
+    petCode.includes('TextUtils.TruncateAt.END') &&
+    petCode.includes('LinearLayout.LayoutParams(-2, -2)'),
+    '2. Dynamic scale relayout must reset TextView layouts, wrap children (-2, -2), ellipsize track title, and scale min_w cleanly'
+  );
+
+  // 3. Standalone lyrics-only plugin without pet + configurable scale & draggable/XY position + synced shared blocks
+  assert.ok(
+    lyricsCode.includes('__id__ = "clawd_lyrics_player"') &&
+    lyricsCode.includes('class ClawdLyricsPlugin(BasePlugin):') &&
+    lyricsCode.includes('class LyricsBubbleTouchListener(') &&
+    lyricsCode.includes('key="pos_v_preset"') &&
+    lyricsCode.includes('key="pos_h_preset"') &&
+    lyricsCode.includes('key="lock_position"') &&
+    lyricsCode.includes('def _open_position_dialog(self):') &&
+    lyricsCode.includes('def _open_bubble_scale_dialog(self):') &&
+    !lyricsCode.includes('class ClawdPetPlugin') &&
+    !lyricsCode.includes('def _render_frame') &&
+    !lyricsCode.includes('def _try_eat'),
+    '3. Standalone clawd_lyrics_player.py must have no pet, support drag + XY + presets + 0.4x-2.0x scale'
+  );
+
+  const lyricsLint = lintClawdPluginCode(lyricsCode);
+  assert.equal(lyricsLint.forbiddenStringsCount, 0, 'Lyrics-only plugin must have 0 forbidden strings');
+
+  // Verify shared blocks match identically between clawd_v3_4.py and clawd_lyrics_player.py
+  const sharedBlocks = [
+    'COLOR_LOGGER_PROXIES',
+    'LYRICS_HELPER',
+    'BRIDGE_DAEMON',
+    'MEDIA_KEYS',
+    'BUBBLE_SCALE_UI',
+    'PLAYER_ENGINE',
+  ];
+  for (const name of sharedBlocks) {
+    const startTag = `# === [SHARED_BLOCK:${name}] ===`;
+    const endTag = `# === [/SHARED_BLOCK:${name}] ===`;
+    const petStart = petCode.indexOf(startTag);
+    const petEnd = petCode.indexOf(endTag);
+    const lyrStart = lyricsCode.indexOf(startTag);
+    const lyrEnd = lyricsCode.indexOf(endTag);
+    assert.ok(petStart !== -1 && petEnd > petStart, `Pet file missing shared block ${name}`);
+    assert.ok(lyrStart !== -1 && lyrEnd > lyrStart, `Lyrics file missing shared block ${name}`);
+    assert.equal(
+      petCode.slice(petStart + startTag.length, petEnd),
+      lyricsCode.slice(lyrStart + startTag.length, lyrEnd),
+      `Shared block ${name} out of sync between clawd_v3_4.py and clawd_lyrics_player.py`
+    );
+  }
+});
+
 

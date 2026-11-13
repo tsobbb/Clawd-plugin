@@ -864,18 +864,18 @@ export default function App() {
             </div>
 
             {/* Quick Cards for Deliverables */}
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
               <div className="bg-neutral-900/80 border border-amber-500/40 rounded-2xl p-5 flex flex-col justify-between">
                 <div>
                   <div className="flex items-center justify-between">
                     <span className="text-xs font-bold text-amber-400 uppercase tracking-wider">
                       Основной плагин
                     </span>
-                    <span className="text-xs font-mono text-emerald-400">3500+ строк</span>
+                    <span className="text-xs font-mono text-emerald-400">Питомец + Плеер</span>
                   </div>
                   <h4 className="font-bold text-neutral-100 text-base mt-2">clawd_v3_4.py</h4>
                   <p className="text-xs text-neutral-400 mt-1">
-                    Полный файл для exteraGram. Все модули, пиксельные спрайты, Обжора 2.0, Bridge 44444.
+                    Полный файл для exteraGram / AprelGram. Спрайты, Обжора 2.0, караоке и Bridge 44444.
                   </p>
                 </div>
                 <div className="flex items-center gap-2 mt-4 pt-4 border-t border-neutral-800">
@@ -898,13 +898,58 @@ export default function App() {
                     ) : (
                       <>
                         <Copy className="w-3.5 h-3.5" />
-                        Скопировать код
+                        Скопировать
                       </>
                     )}
                   </button>
                   <a
                     href="/clawd_v3_4.py"
                     download="clawd_v3_4.py"
+                    className="p-1.5 rounded-lg bg-neutral-800 hover:bg-neutral-700 text-neutral-200"
+                    title="Скачать файл"
+                  >
+                    <Download className="w-4 h-4" />
+                  </a>
+                </div>
+              </div>
+
+              <div className="bg-neutral-900/80 border border-emerald-500/40 rounded-2xl p-5 flex flex-col justify-between">
+                <div>
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-bold text-emerald-400 uppercase tracking-wider">
+                      Только текстовик
+                    </span>
+                    <span className="text-xs font-mono text-emerald-400">Без питомца</span>
+                  </div>
+                  <h4 className="font-bold text-neutral-100 text-base mt-2">clawd_lyrics_player.py</h4>
+                  <p className="text-xs text-neutral-400 mt-1">
+                    Отдельный плагин плеера с перетаскиваемой рамкой, позицией X/Y, масштабом 0.4x–2.0x и синхронизированным ядром.
+                  </p>
+                </div>
+                <div className="flex items-center gap-2 mt-4 pt-4 border-t border-neutral-800">
+                  <button
+                    onClick={() => {
+                      fetch('/clawd_lyrics_player.py')
+                        .then((r) => r.text())
+                        .then((txt) => copyToClipboard(txt, 'clawd_lyrics_player.py'));
+                    }}
+                    className="flex-1 py-1.5 px-3 rounded-lg bg-neutral-800 hover:bg-neutral-700 text-xs font-medium text-neutral-200 flex items-center justify-center gap-1.5 transition-all"
+                  >
+                    {copiedFile === 'clawd_lyrics_player.py' ? (
+                      <>
+                        <Check className="w-3.5 h-3.5 text-emerald-400" />
+                        Скопировано!
+                      </>
+                    ) : (
+                      <>
+                        <Copy className="w-3.5 h-3.5" />
+                        Скопировать
+                      </>
+                    )}
+                  </button>
+                  <a
+                    href="/clawd_lyrics_player.py"
+                    download="clawd_lyrics_player.py"
                     className="p-1.5 rounded-lg bg-neutral-800 hover:bg-neutral-700 text-neutral-200"
                     title="Скачать файл"
                   >

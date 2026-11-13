@@ -38,6 +38,11 @@ from client_utils import get_last_fragment
 from ui.settings import Divider, Header, Selector, Switch, Text
 
 try:
+    from android.text import TextUtils
+except Exception:
+    TextUtils = None
+
+try:
     from org.telegram.ui.Cells import ChatMessageCell
 except Exception:
     ChatMessageCell = None
@@ -315,6 +320,7 @@ PEEK_HIDDEN_UNITS = 3
 PEEK_OUT_UNITS = 7
 
 
+# === [SHARED_BLOCK:COLOR_LOGGER_PROXIES] ===
 def as_java_color(color: int) -> int:
     value = int(color) & 0xFFFFFFFF
     return value - 0x100000000 if value >= 0x80000000 else value
@@ -669,6 +675,7 @@ class BubbleScaleSeekListener(dynamic_proxy(SeekBar.OnSeekBarChangeListener)):
 
     def onStopTrackingTouch(self, seek_bar):
         pass
+# === [/SHARED_BLOCK:COLOR_LOGGER_PROXIES] ===
 
 
 class RecyclerAttachStateListener(dynamic_proxy(RecyclerView.OnChildAttachStateChangeListener)):
@@ -710,6 +717,7 @@ class RecyclerAttachStateListener(dynamic_proxy(RecyclerView.OnChildAttachStateC
             CLOG.log_error("RECYCLER", "Attach listener error", e)
 
 
+# === [SHARED_BLOCK:LYRICS_HELPER] ===
 class LyricsHelper:
     """Караоке, SoundCloud oEmbed и локальный архив LRCLIB / NetEase."""
 
@@ -913,6 +921,7 @@ class LyricsHelper:
                     self.loading.discard(key)
 
         threading.Thread(target=_worker, daemon=True, name="lyrics_fetcher").start()
+# === [/SHARED_BLOCK:LYRICS_HELPER] ===
 
 
 class PetTouchListener(dynamic_proxy(View.OnTouchListener)):
@@ -1165,6 +1174,7 @@ class ClawdPetPlugin(BasePlugin):
         # Сброс логов на диск
         CLOG.flush_and_stop()
 
+# === [SHARED_BLOCK:BRIDGE_DAEMON] ===
     def _start_bridge_daemon(self):
         if self._bridge_thread is not None and self._bridge_thread.is_alive():
             return
@@ -1363,10 +1373,14 @@ class ClawdPetPlugin(BasePlugin):
                 ts = ts / 1000.0
             # Считывается только если timestamp внутри файла не старше 5 секунд!
             if abs(time.time() - ts) <= 5.0:
-                # Извлекаются исключительно artist и title для поиска текста!
+                has_media = bool(d.get("has_media", True))
+                is_playing = bool(d.get("is_playing", True))
+                if not has_media:
+                    return None
+                # Извлекаются исключительно метаданные для поиска текста и статус паузы!
                 return {
                     "has_media": True,
-                    "is_playing": True,
+                    "is_playing": is_playing,
                     "player": d.get("player", "sync_file"),
                     "artist": d.get("artist", ""),
                     "title": d.get("title", ""),
@@ -1374,11 +1388,13 @@ class ClawdPetPlugin(BasePlugin):
                     "duration_ms": 0,
                     "position_known": False,
                     "timestamp": ts,
+                    "_received_mono": time.monotonic(),
                     "is_fallback": True,
                 }
         except Exception:
             pass
         return None
+# === [/SHARED_BLOCK:BRIDGE_DAEMON] ===
 
     def _add_observers(self):
         delegate = self._msg_delegate
@@ -1826,9 +1842,10 @@ class ClawdPetPlugin(BasePlugin):
         except Exception as e:
             CLOG.log_error("CACHE", "Cache clean error", e)
 
+# === [SHARED_BLOCK:MEDIA_KEYS] ===
     def _dispatch_media_key(self, key_code: int):
         try:
-            ctx = self._pet.getContext() if self._pet else LaunchActivity.instance
+            ctx = self._pet.getContext() if self._pet else (self._bubble.getContext() if self._bubble else LaunchActivity.instance)
             if not ctx:
                 return
             am = ctx.getSystemService(Context.AUDIO_SERVICE)
@@ -1838,6 +1855,7 @@ class ClawdPetPlugin(BasePlugin):
                 self._hop(self._dp(200))
         except Exception as e:
             CLOG.log_error("MEDIA_KEY", "Key dispatch error", e)
+# === [/SHARED_BLOCK:MEDIA_KEYS] ===
 
     def _reload_cfg(self):
         try:
@@ -1879,6 +1897,35 @@ class ClawdPetPlugin(BasePlugin):
             run_on_ui_thread(lambda: self._apply_show(bool(value)))
         elif key in ("size", "color", "hat"):
             run_on_ui_thread(self._rebuild_sprites)
+        elif key == "dance" and not value:
+            def _stop_music_state():
+                self._media = None
+                self._track_is_playing = False
+                self._is_singing = False
+                self._test_karaoke_active = False
+                self._current_track_id = None
+                self._lyrics_timeline = []
+                self._clear_playback_anchors(reset_user_offset=False)
+                self._accent_color = None
+                self._target_palette = DEFAULT_KARAOKE_PALETTE
+                self._clear_artwork()
+                if self._handler and self._karaoke_switch_r:
+                    self._handler.removeCallbacks(self._karaoke_switch_r)
+                self._hide_bubble()
+                self._last_rendered_frame_key = None
+                self._schedule(0)
+            run_on_ui_thread(_stop_music_state)
+        elif key == "karaoke" and not value:
+            def _stop_karaoke_state():
+                self._is_singing = False
+                self._test_karaoke_active = False
+                if self._handler and self._karaoke_switch_r:
+                    self._handler.removeCallbacks(self._karaoke_switch_r)
+                if self._bubble_mode == "karaoke":
+                    self._hide_bubble()
+                self._last_rendered_frame_key = None
+                self._schedule(0)
+            run_on_ui_thread(_stop_karaoke_state)
         elif key == "animated_gradient_border":
             run_on_ui_thread(self._apply_karaoke_bubble_style)
         elif key == "bubble_scale":
@@ -1890,6 +1937,7 @@ class ClawdPetPlugin(BasePlugin):
         elif key == "shake":
             run_on_ui_thread(self._start_sensor if value else self._stop_sensor)
 
+# === [SHARED_BLOCK:BUBBLE_SCALE_UI] ===
     def _bubble_scale(self) -> float:
         try:
             return clamp(float(self._cfg.get("bubble_scale", 1.0) or 1.0), 0.4, 2.0)
@@ -1924,9 +1972,12 @@ class ClawdPetPlugin(BasePlugin):
             if prev_mode == "karaoke":
                 self._apply_karaoke_geometry(s)
                 self._apply_karaoke_bubble_style()
-            elif prev_mode == "speech":
+            elif prev_mode == "speech" and hasattr(self, "_apply_speech_geometry"):
                 self._apply_speech_geometry(s)
-            self._bubble.requestLayout()
+            else:
+                self._relayout_bubble()
+            if hasattr(self, "_on_bubble_resized"):
+                self._on_bubble_resized()
         except Exception as e:
             CLOG.log_error("BUBBLE_SCALE", "Scale refresh error", e)
 
@@ -2009,6 +2060,7 @@ class ClawdPetPlugin(BasePlugin):
             b.show()
         except Exception as e:
             CLOG.log_error("BUBBLE_SCALE", "Scale dialog error", e)
+# === [/SHARED_BLOCK:BUBBLE_SCALE_UI] ===
 
     def _on_menu_toggle(self, context=None):
         show = not self._cfg.get("show", True)
@@ -2153,29 +2205,32 @@ class ClawdPetPlugin(BasePlugin):
         artwork_title_tv.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 10.5 * s)
         artwork_title_tv.setTextColor(as_java_color(0xCCFFFFFF))
         artwork_title_tv.setMaxLines(1)
+        artwork_title_tv.setSingleLine(True)
+        if TextUtils is not None:
+            artwork_title_tv.setEllipsize(TextUtils.TruncateAt.END)
         artwork_title_tv.setPadding(max(3, AndroidUtilities.dp(8.0 * s)), 0, 0, 0)
-        artwork_row.addView(artwork_title_tv, LinearLayout.LayoutParams(0, -2, 1.0))
-        bubble_layout.addView(artwork_row, LinearLayout.LayoutParams(-1, -2))
+        artwork_row.addView(artwork_title_tv, LinearLayout.LayoutParams(-2, -2))
+        bubble_layout.addView(artwork_row, LinearLayout.LayoutParams(-2, -2))
 
         bubble_text = TextView(context)
         bubble_text.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 13.0 * s)
-        bubble_text.setMinimumWidth(AndroidUtilities.dp(210.0 * s))
+        bubble_text.setMinimumWidth(0)
         bubble_text.setMaxWidth(AndroidUtilities.dp(260.0 * s))
         bubble_text.setGravity(Gravity.CENTER_HORIZONTAL)
         try:
             bubble_text.setTypeface(AndroidUtilities.bold())
         except Exception:
             pass
-        bubble_layout.addView(bubble_text, LinearLayout.LayoutParams(-1, -2))
+        bubble_layout.addView(bubble_text, LinearLayout.LayoutParams(-2, -2))
 
         bubble_subtext = TextView(context)
         bubble_subtext.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 10.5 * s)
-        bubble_subtext.setMinimumWidth(AndroidUtilities.dp(210.0 * s))
+        bubble_subtext.setMinimumWidth(0)
         bubble_subtext.setMaxWidth(AndroidUtilities.dp(260.0 * s))
         bubble_subtext.setGravity(Gravity.CENTER_HORIZONTAL)
         bubble_subtext.setAlpha(0.45)
-        bubble_subtext.setVisibility(View.VISIBLE)
-        bubble_layout.addView(bubble_subtext, LinearLayout.LayoutParams(-1, -2))
+        bubble_subtext.setVisibility(View.GONE)
+        bubble_layout.addView(bubble_subtext, LinearLayout.LayoutParams(-2, -2))
 
         controls = LinearLayout(context)
         controls.setOrientation(LinearLayout.HORIZONTAL)
@@ -2200,7 +2255,7 @@ class ClawdPetPlugin(BasePlugin):
         controls.addView(_make_btn("⏯", lambda: self._dispatch_media_key(KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE)))
         controls.addView(_make_btn("⏭", lambda: self._dispatch_media_key(KeyEvent.KEYCODE_MEDIA_NEXT)))
         controls.addView(_make_btn("📋", lambda: self._open_tap_to_sync_dialog()))
-        bubble_layout.addView(controls, LinearLayout.LayoutParams(-1, -2))
+        bubble_layout.addView(controls, LinearLayout.LayoutParams(-2, -2))
 
         self._decor.addView(bubble_layout, FrameLayout.LayoutParams(-2, -2))
         self._bubble = bubble_layout
@@ -2213,6 +2268,7 @@ class ClawdPetPlugin(BasePlugin):
         self._media_controls_layout = controls
         self._bubble_visible = False
         self._frame_key = None
+        self._last_rendered_frame_key = None
         self._pos_ready = False
 
     def _clear_artwork(self):
@@ -3592,7 +3648,7 @@ class ClawdPetPlugin(BasePlugin):
         elif color_idx == 10:
             color_sig = Theme.getColor(Theme.key_actionBarDefault)
 
-        music_phones = bool(self._media == "music" and self._track_is_playing and state != "sleep")
+        music_phones = bool(self._cfg.get("dance", True) and self._media == "music" and self._track_is_playing and not self._paused and state != "sleep")
         return (eyes, look, arms, legs, squash, blush, mouth, hat, fat, color_sig, music_phones)
 
     def _render(self, now):
@@ -4060,6 +4116,7 @@ class ClawdPetPlugin(BasePlugin):
                 self._say("sent")
         self._schedule(0)
 
+# === [SHARED_BLOCK:PLAYER_ENGINE] ===
     def _clear_playback_anchors(self, reset_user_offset: bool = False):
         self._anchor_pos_ms = 0.0
         self._anchor_mono = 0.0
@@ -4264,10 +4321,14 @@ class ClawdPetPlugin(BasePlugin):
 
             with self._bridge_lock:
                 bridge_snapshot = self._bridge_data
+            if bridge_snapshot and not self._bridge_sse_connected and not bridge_snapshot.get("is_fallback"):
+                b_rx_chk = float(bridge_snapshot.get("_received_mono") or 0.0)
+                if b_rx_chk <= 0.0 or (now - b_rx_chk) > 4.0:
+                    bridge_snapshot = None
 
         if self._test_karaoke_active:
             test_done = False
-            if not self._cfg.get("karaoke", True) or tg_playing_now or (bridge_snapshot and bridge_snapshot.get("has_media") and bridge_snapshot.get("is_playing")):
+            if not self._cfg.get("dance", True) or not self._cfg.get("karaoke", True) or tg_playing_now or (bridge_snapshot and bridge_snapshot.get("has_media") and bridge_snapshot.get("is_playing")):
                 test_done = True
             elif self._lyrics_timeline and self._get_current_track_pos(now) > self._lyrics_timeline[-1][0] + 6.0:
                 test_done = True
@@ -4715,6 +4776,8 @@ class ClawdPetPlugin(BasePlugin):
             view.setText(new_text)
             view.setTranslationY(0.0)
             view.setAlpha(target_alpha)
+            view.forceLayout()
+            view.requestLayout()
             return
 
         try:
@@ -4727,6 +4790,11 @@ class ClawdPetPlugin(BasePlugin):
                         return
                     view.setText(new_text)
                     view.setTranslationY(shift_dp)
+                    view.forceLayout()
+                    view.requestLayout()
+                    if self._bubble is not None:
+                        self._bubble.forceLayout()
+                        self._bubble.requestLayout()
                     view.animate().translationY(0.0).alpha(target_alpha).setDuration(85).start()
                 except Exception:
                     pass
@@ -4736,6 +4804,8 @@ class ClawdPetPlugin(BasePlugin):
             view.setText(new_text)
             view.setTranslationY(0.0)
             view.setAlpha(target_alpha)
+            view.forceLayout()
+            view.requestLayout()
 
     def _rotate_palette(self, palette: Tuple[int, int, int], now: float) -> Tuple[int, int, int]:
         phase = (now * 0.55) % 3.0
@@ -4847,26 +4917,76 @@ class ClawdPetPlugin(BasePlugin):
                 self._grad_anim_start = time.monotonic() - 1.0
                 self._handler.postDelayed(self._grad_anim_r, 33)
 
+    def _max_bubble_width_px(self) -> int:
+        decor_w = int(self._decor.getWidth()) if self._decor is not None else 0
+        if decor_w <= 0:
+            try:
+                decor_w = int(AndroidUtilities.displaySize.x)
+            except Exception:
+                decor_w = AndroidUtilities.dp(360)
+        return max(AndroidUtilities.dp(120), decor_w - AndroidUtilities.dp(24))
+
+    def _relayout_bubble(self):
+        for v in (
+            self._artwork_title_tv,
+            self._artwork_view,
+            self._artwork_row,
+            self._bubble_text,
+            self._bubble_subtext,
+            self._media_controls_layout,
+        ):
+            if v is not None:
+                if isinstance(v, TextView):
+                    try:
+                        cur = v.getText()
+                        v.setText(cur if cur is not None else "")
+                    except Exception:
+                        pass
+                v.forceLayout()
+                v.requestLayout()
+        if self._bubble is not None:
+            self._bubble.forceLayout()
+            self._bubble.requestLayout()
+
     def _apply_karaoke_geometry(self, s: float):
         if self._bubble is None:
             return
-        self._bubble.setMinimumWidth(AndroidUtilities.dp(210.0 * s))
-        self._bubble.setLayoutParams(FrameLayout.LayoutParams(-2, -2))
         pad12 = max(4, int(self._dp(12) * s))
         pad7 = max(2, int(self._dp(7) * s))
+        screen_cap = self._max_bubble_width_px()
+        max_w = min(AndroidUtilities.dp(260.0 * s), max(AndroidUtilities.dp(100), screen_cap - pad12 * 2))
+        base_min = 210.0 if abs(s - 1.0) < 0.01 else 110.0 * s
+        min_w = min(AndroidUtilities.dp(base_min), max_w)
+        self._bubble.setMinimumWidth(min_w)
+        self._bubble.setLayoutParams(FrameLayout.LayoutParams(-2, -2))
         self._bubble.setPadding(pad12, pad7, pad12, pad7)
+
+        art_sz = max(12, AndroidUtilities.dp(32.0 * s))
+        if self._artwork_row is not None:
+            self._artwork_row.setLayoutParams(LinearLayout.LayoutParams(-2, -2))
+        if self._artwork_title_tv is not None:
+            self._artwork_title_tv.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 10.5 * s)
+            self._artwork_title_tv.setSingleLine(True)
+            if TextUtils is not None:
+                self._artwork_title_tv.setEllipsize(TextUtils.TruncateAt.END)
+            self._artwork_title_tv.setMaxWidth(max(AndroidUtilities.dp(50), max_w - art_sz - AndroidUtilities.dp(10.0 * s)))
+            self._artwork_title_tv.setLayoutParams(LinearLayout.LayoutParams(-2, -2))
+        if self._media_controls_layout is not None:
+            self._media_controls_layout.setLayoutParams(LinearLayout.LayoutParams(-2, -2))
+
         if self._bubble_text is not None:
             self._bubble_text.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 13.0 * s)
-            self._bubble_text.setMinimumWidth(AndroidUtilities.dp(210.0 * s))
-            self._bubble_text.setMaxWidth(AndroidUtilities.dp(260.0 * s))
+            self._bubble_text.setMinimumWidth(0)
+            self._bubble_text.setMaxWidth(max_w)
             self._bubble_text.setGravity(Gravity.CENTER_HORIZONTAL)
-            self._bubble_text.setLayoutParams(LinearLayout.LayoutParams(-1, -2))
+            self._bubble_text.setLayoutParams(LinearLayout.LayoutParams(-2, -2))
         if self._bubble_subtext is not None:
             self._bubble_subtext.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 10.5 * s)
-            self._bubble_subtext.setMinimumWidth(AndroidUtilities.dp(210.0 * s))
-            self._bubble_subtext.setMaxWidth(AndroidUtilities.dp(260.0 * s))
+            self._bubble_subtext.setMinimumWidth(0)
+            self._bubble_subtext.setMaxWidth(max_w)
             self._bubble_subtext.setGravity(Gravity.CENTER_HORIZONTAL)
-            self._bubble_subtext.setLayoutParams(LinearLayout.LayoutParams(-1, -2))
+            self._bubble_subtext.setLayoutParams(LinearLayout.LayoutParams(-2, -2))
+        self._relayout_bubble()
 
     def _apply_speech_geometry(self, s: float):
         if self._bubble is None:
@@ -4877,25 +4997,30 @@ class ClawdPetPlugin(BasePlugin):
         bg.setStroke(max(1, int(self._dp(1))), Theme.getColor(Theme.key_divider))
         self._bubble.setBackground(bg)
 
-        self._bubble.setMinimumWidth(0)
-        self._bubble.setLayoutParams(FrameLayout.LayoutParams(-2, -2))
         pad10 = max(3, int(self._dp(10) * s))
         pad6 = max(2, int(self._dp(6) * s))
+        screen_cap = self._max_bubble_width_px()
+        max_w = min(AndroidUtilities.dp(200.0 * s), max(AndroidUtilities.dp(90), screen_cap - pad10 * 2))
+
+        self._bubble.setMinimumWidth(0)
+        self._bubble.setLayoutParams(FrameLayout.LayoutParams(-2, -2))
         self._bubble.setPadding(pad10, pad6, pad10, pad6)
 
         if self._bubble_text is not None:
             self._bubble_text.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 13.0 * s)
             self._bubble_text.setMinimumWidth(0)
-            self._bubble_text.setMaxWidth(AndroidUtilities.dp(200.0 * s))
+            self._bubble_text.setMaxWidth(max_w)
             self._bubble_text.setGravity(Gravity.NO_GRAVITY)
             self._bubble_text.setLayoutParams(LinearLayout.LayoutParams(-2, -2))
             self._bubble_text.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlackText))
         if self._artwork_row is not None:
             self._artwork_row.setVisibility(View.GONE)
         if self._bubble_subtext is not None:
+            self._bubble_subtext.setText("")
             self._bubble_subtext.setVisibility(View.GONE)
         if self._media_controls_layout is not None:
             self._media_controls_layout.setVisibility(View.GONE)
+        self._relayout_bubble()
 
     def _show_karaoke_line(self, current_text: str, next_text: str, now: float):
         if self._bubble is None or self._bubble_text is None:
@@ -4918,20 +5043,27 @@ class ClawdPetPlugin(BasePlugin):
             self._animate_text_change(self._bubble_text, current_text, target_alpha=1.0, animate=do_anim)
 
             if self._bubble_subtext is not None:
-                self._bubble_subtext.setVisibility(View.VISIBLE)
                 if next_text:
+                    self._bubble_subtext.setVisibility(View.VISIBLE)
                     self._bubble_subtext.setTextColor(as_java_color(0x77FFFFFF))
                     self._animate_text_change(self._bubble_subtext, next_text, target_alpha=0.45, animate=do_anim)
                 else:
-                    self._animate_text_change(self._bubble_subtext, " ", target_alpha=0.0, animate=do_anim)
+                    self._bubble_subtext.setText("")
+                    self._bubble_subtext.setVisibility(View.GONE)
 
             if self._media_controls_layout is not None and self._cfg.get("media_controls", True):
                 self._media_controls_layout.setVisibility(View.VISIBLE)
+            elif self._media_controls_layout is not None:
+                self._media_controls_layout.setVisibility(View.GONE)
 
             self._bubble.setVisibility(View.VISIBLE)
             self._bubble.setAlpha(1.0)
             self._bubble_visible = True
             self._bubble_until = now + 9.0
+            self._bubble.forceLayout()
+            self._bubble.requestLayout()
+            if hasattr(self, "_on_bubble_resized"):
+                self._on_bubble_resized()
         except Exception as e:
             CLOG.log_error("KARAOKE_UI", "Show line error", e)
 
@@ -5027,6 +5159,7 @@ class ClawdPetPlugin(BasePlugin):
             run_on_ui_thread(_apply)
 
         self._lyrics_helper.get_lyrics_async(a, t, _on_loaded)
+# === [/SHARED_BLOCK:PLAYER_ENGINE] ===
 
     def _format_phrase(self, text: str, name: Optional[str] = None) -> str:
         t_now = time.strftime("%H:%M")
@@ -5060,6 +5193,7 @@ class ClawdPetPlugin(BasePlugin):
             if self._bubble_subtext is not None:
                 self._bubble_subtext.animate().cancel()
                 self._bubble_subtext.setTranslationY(0.0)
+                self._bubble_subtext.setText("")
 
             if self._bubble_mode != "speech":
                 self._bubble_mode = "speech"
@@ -5067,7 +5201,11 @@ class ClawdPetPlugin(BasePlugin):
 
             if self._bubble_text is not None:
                 self._bubble_text.setText(text)
+                self._bubble_text.forceLayout()
+                self._bubble_text.requestLayout()
 
+            self._bubble.forceLayout()
+            self._bubble.requestLayout()
             self._bubble.setAlpha(0.0)
             self._bubble.setVisibility(View.VISIBLE)
             self._bubble_visible = True
