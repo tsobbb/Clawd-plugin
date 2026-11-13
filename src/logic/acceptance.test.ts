@@ -160,12 +160,14 @@ test('Clawd v3.5 satisfies all requirements from ТЗ v3.5', () => {
     '2.1: В _say() минимальная ширина сбрасывается в 0'
   );
   assert.ok(
+    code.includes('self._bubble.setMinimumWidth(AndroidUtilities.dp(210.0 * s))') ||
     code.includes('self._bubble.setMinimumWidth(AndroidUtilities.dp(210))'),
-    '2.2: В _show_karaoke_line минимальная ширина фиксируется на 210dp'
+    '2.2: В _show_karaoke_line минимальная ширина фиксируется на 210dp (с поддержкой bubble_scale)'
   );
   assert.ok(
+    code.includes('setMaxWidth(AndroidUtilities.dp(260.0 * s))') ||
     code.includes('setMaxWidth(AndroidUtilities.dp(260))'),
-    '2.2: Максимальная ширина текста 260dp'
+    '2.2: Максимальная ширина текста 260dp (с поддержкой bubble_scale)'
   );
   assert.ok(
     code.includes('Gravity.CENTER_HORIZONTAL'),
@@ -268,3 +270,62 @@ test('Clawd Bridge v2.0: clean pet background, singing mouth toggle, 3-color gra
     '4.2: Monotonic anchor extrapolation, 3-tier anti-drift (>=180ms / >50ms), post-LRC live re-anchoring, and clean reset required'
   );
 });
+
+test('Clawd Bridge v2.1: Telegram artwork/accents, animated gradient toggle, DM scope toggle, lag fixes, rational headphones, bubble_scale 0.4x-2.0x', () => {
+  const filePath = path.resolve(process.cwd(), 'public/clawd_v3_4.py');
+  const code = fs.readFileSync(filePath, 'utf-8');
+
+  // 1. Telegram playback enriched with Bridge artwork, accent colors & SSE timing via _bridge_matches
+  assert.ok(
+    code.includes('def _bridge_matches(self, snap, tg_a: str, tg_t: str)') &&
+    code.includes('if self._bridge_matches(bridge_snapshot, track_artist or "", track_title or "")') &&
+    code.includes('if self._bridge_matches(bridge_snapshot, track_artist, track_title)'),
+    '1. Telegram playing/paused must merge artwork, accent_colors & SSE position from matching Clawd Bridge'
+  );
+
+  // 2. Animated rotating gradient border toggle (default True)
+  assert.ok(
+    code.includes('key="animated_gradient_border"') &&
+    code.includes('default=True') &&
+    code.includes('def _rotate_palette(') &&
+    code.includes('border_pal = self._rotate_palette(cur, now)'),
+    '2. animated_gradient_border toggle (default True) and _rotate_palette circular animation required'
+  );
+
+  // 3. DM vs Group chat scope toggle (default 0: DMs only)
+  assert.ok(
+    code.includes('TG_CHAT_SCOPE_ITEMS') &&
+    code.includes('key="tg_chat_scope"') &&
+    code.includes('default=0') &&
+    code.includes('if scope == 0 and dialog_id <= 0:'),
+    '3. tg_chat_scope selector defaulting to 0 (DMs only, ignoring group dialog_id <= 0) required'
+  );
+
+  // 4. Lyric lag reduction: 850ms non-Bridge seek threshold, math.ceil + 8ms wakeup padding, 65ms/85ms anim, failsafe seek-back
+  assert.ok(
+    code.includes('abs(delta) >= 850.0') &&
+    code.includes('math.ceil(((wake_at - t_karaoke) / speed) * 1000.0)) + 8') &&
+    code.includes('setDuration(65)') &&
+    code.includes('setDuration(85)') &&
+    code.includes('elif self._current_lyric_idx >= 0:'),
+    '4. Remaining lyric lag fixes (850ms TG threshold, ceil+8ms wakeup, 65/85ms text anim, failsafe <0 index) required'
+  );
+
+  // 5. Rational connected headphones (no air gap, cached with music_phones, avoids clobbering full hats)
+  assert.ok(
+    code.includes('music_phones = bool(self._media == "music" and self._track_is_playing and state != "sleep")') &&
+    code.includes('if "Наушники DJ" in hat or (music_phones and ("Без шапки" in hat or "Очки Thug" in hat)):') &&
+    code.includes('px(left + 1, top - 1, right - 1, top, band_c)'),
+    '5. Connected headphone headband at top-1, music_phones cache key, and hat-preserving condition required'
+  );
+
+  // 6. Configurable text frame scale 0.4x - 2.0x
+  assert.ok(
+    code.includes('def _bubble_scale(self) -> float:') &&
+    code.includes('clamp(float(self._cfg.get("bubble_scale", 1.0) or 1.0), 0.4, 2.0)') &&
+    code.includes('def _open_bubble_scale_dialog(self):') &&
+    code.includes('seek.setMax(32)'),
+    '6. bubble_scale 0.4x-2.0x dialog and geometry scaling required'
+  );
+});
+
