@@ -16,7 +16,7 @@ import urllib.request
 from typing import Any, Dict, List, Optional, Tuple
 
 from android.content import ClipData, ClipboardManager, ComponentName, Context, DialogInterface, Intent
-from android.graphics import Bitmap, Canvas, Paint
+from android.graphics import Bitmap, BitmapFactory, Canvas, Paint
 from android.graphics.drawable import GradientDrawable
 from android.hardware import Sensor, SensorEventListener, SensorManager
 from android.media import AudioManager
@@ -331,6 +331,25 @@ def clamp(value, lo, hi):
     if hi < lo:
         return lo
     return lo if value < lo else hi if value > hi else value
+
+
+def parse_hex_color(raw: Optional[str]) -> Optional[int]:
+    if not raw or not isinstance(raw, str):
+        return None
+    s = raw.strip()
+    if s.startswith("#"):
+        s = s[1:]
+    if len(s) == 6:
+        try:
+            return 0xFF000000 | int(s, 16)
+        except Exception:
+            return None
+    if len(s) == 8:
+        try:
+            return int(s, 16) & 0xFFFFFFFF
+        except Exception:
+            return None
+    return None
 
 
 class ClaudeLogger:
@@ -914,8 +933,14 @@ class ClawdPetPlugin(BasePlugin):
         self._cfg = {}
 
         self._decor = None
+        self._aura_view = None
         self._pet = None
         self._bubble = None
+        self._artwork_row = None
+        self._artwork_view = None
+        self._artwork_title_tv = None
+        self._artwork_bmp = None
+        self._artwork_track_key = None
         self._bubble_text = None
         self._bubble_subtext = None
         self._media_controls_layout = None
@@ -950,6 +975,11 @@ class ClawdPetPlugin(BasePlugin):
         self._last_rendered_frame_key = None
         self._last_rendered_bmp = None
         self._bubble_mode = None
+        self._last_bubble_accent = None
+        self._last_aura_color = None
+        self._last_aura_x = None
+        self._last_aura_y = None
+        self._last_aura_visible = False
 
         self._lyrics_helper = LyricsHelper(logger_cb=self._add_debug_log)
         self._current_track_id = None
@@ -966,18 +996,24 @@ class ClawdPetPlugin(BasePlugin):
         self._track_base_pos = 0.0
         self._track_base_time = 0.0
         self._track_is_playing = False
+        self._playback_speed = 1.0
+        self._accent_color: Optional[int] = None
         self._user_offset = 0.0
         self._session_offsets: Dict[str, float] = {}
         self._position_known = True
 
-        # Clawd Bridge сетевой шлюз
+        # Clawd Bridge сетевой шлюз (SSE + Polling Fallback)
         self._bridge_thread = None
         self._bridge_stop_event = threading.Event()
         self._bridge_consecutive_errors = 0
-        self._bridge_interval = 0.38  # 350-400 мс штатный
+        self._bridge_interval = 0.38  # 350-400 мс штатный polling fallback
         self._bridge_last_ping_latency = 0.0
         self._bridge_data: Optional[Dict[str, Any]] = None
         self._bridge_lock = threading.Lock()
+        self._bridge_mode = "INIT"
+        self._bridge_sse_resp = None
+        self._bridge_push_pending = False
+        self._last_sse_rx_mono = 0.0
 
         # Буфер обмена
         self._last_checked_clip = ""
@@ -1063,62 +1099,179 @@ class ClawdPetPlugin(BasePlugin):
         self._bridge_stop_event.clear()
         self._bridge_thread = threading.Thread(target=self._bridge_worker, daemon=True, name="clawd_bridge_client")
         self._bridge_thread.start()
-        CLOG.log_info("BRIDGE", "Поток Clawd Bridge запущен: опрос 350-400 мс")
+        CLOG.log_info("BRIDGE", "Поток Clawd Bridge запущен: SSE (/events) + fallback polling (/now-playing)")
 
     def _stop_bridge_daemon(self):
         self._bridge_stop_event.set()
+        resp = self._bridge_sse_resp
+        self._bridge_sse_resp = None
+        if resp is not None:
+            try:
+                resp.close()
+            except Exception:
+                pass
         if self._bridge_thread and self._bridge_thread.is_alive():
             self._bridge_thread.join(timeout=0.6)
         self._bridge_thread = None
 
-    def _bridge_worker(self):
-        url = "http://127.0.0.1:44444/now-playing"
-        while not self._bridge_stop_event.is_set():
-            t0 = time.monotonic()
-            success = False
-            data = None
-            try:
-                # Таймаут: connect=200ms, read=500ms -> timeout=0.5s
-                req = urllib.request.Request(
-                    url,
-                    headers={
-                        "User-Agent": f"ClawdPet/{__version__} (Android)",
-                        "Host": "127.0.0.1:44444",
-                    },
-                )
-                with urllib.request.urlopen(req, timeout=0.5) as resp:
-                    if resp.status == 200:
-                        raw = resp.read().decode("utf-8")
-                        data = json.loads(raw)
-                        success = True
-            except Exception as e:
-                # HTTP ошибка соединения
-                pass
+    def _schedule_bridge_sse_wake(self):
+        if self._unloaded or self._bridge_push_pending:
+            return
+        self._bridge_push_pending = True
 
-            dt_ping = (time.monotonic() - t0) * 1000.0
+        def _wake():
+            self._bridge_push_pending = False
+            if self._unloaded or not self._running or self._paused:
+                return
+            self._media_check = 0.0
+            if self._pos_ready:
+                self._poll_media(time.monotonic())
+            self._schedule(0)
+
+        run_on_ui_thread(_wake)
+
+    def _on_bridge_payload(self, data: Dict[str, Any], mode: str, dt_ping: float = 0.0):
+        if self._bridge_consecutive_errors >= 5:
+            CLOG.log_info("BRIDGE", f"Связь восстановлена ({mode})! Сброс backoff")
+        self._bridge_consecutive_errors = 0
+        self._bridge_interval = random.uniform(0.35, 0.40)
+        self._bridge_mode = mode
+        if dt_ping > 0.0:
             self._bridge_last_ping_latency = dt_ping
+        payload = dict(data)
+        payload["_received_mono"] = time.monotonic()
+        payload["_is_sse_event"] = (mode == "SSE")
+        with self._bridge_lock:
+            self._bridge_data = payload
+        if mode == "SSE":
+            self._schedule_bridge_sse_wake()
 
-            if success and data:
-                if self._bridge_consecutive_errors >= 5:
-                    CLOG.log_info("BRIDGE", f"Связь восстановлена (200 OK)! Сброс backoff на {self._bridge_interval*1000:.0f} мс")
-                self._bridge_consecutive_errors = 0
-                self._bridge_interval = random.uniform(0.35, 0.40)
-                with self._bridge_lock:
-                    self._bridge_data = data
-            else:
-                self._bridge_consecutive_errors += 1
-                if self._bridge_consecutive_errors == 5:
-                    self._bridge_interval = 3.0
-                    CLOG.log_warn("BRIDGE", "5 ошибок связи подряд! Переход в ступенчатый backoff на 3.0 секунды")
-                elif self._bridge_consecutive_errors > 5:
-                    self._bridge_interval = 3.0
+    def _bridge_poll_once(self) -> Tuple[bool, Optional[Dict[str, Any]], float]:
+        url = "http://127.0.0.1:44444/now-playing"
+        t0 = time.monotonic()
+        try:
+            req = urllib.request.Request(
+                url,
+                headers={
+                    "User-Agent": f"ClawdPet/{__version__} (Android)",
+                    "Host": "127.0.0.1:44444",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=0.5) as resp:
+                if resp.status == 200:
+                    raw = resp.read().decode("utf-8")
+                    data = json.loads(raw)
+                    dt_ping = (time.monotonic() - t0) * 1000.0
+                    return True, data, dt_ping
+        except Exception:
+            pass
+        return False, None, (time.monotonic() - t0) * 1000.0
 
-                # Резервный файл sync.json
-                fallback_data = self._read_fallback_sync_json()
-                with self._bridge_lock:
-                    self._bridge_data = fallback_data
+    def _bridge_sse_loop(self) -> bool:
+        sse_url = "http://127.0.0.1:44444/events"
+        t0 = time.monotonic()
+        resp = None
+        connected = False
+        try:
+            req = urllib.request.Request(
+                sse_url,
+                headers={
+                    "Accept": "text/event-stream",
+                    "Cache-Control": "no-cache",
+                    "User-Agent": f"ClawdPet/{__version__} (Android)",
+                    "Host": "127.0.0.1:44444",
+                },
+            )
+            resp = urllib.request.urlopen(req, timeout=22.0)
+            self._bridge_sse_resp = resp
+            if getattr(resp, "status", 200) != 200:
+                return False
+            connected = True
+            self._bridge_mode = "SSE"
+            self._bridge_consecutive_errors = 0
+            self._bridge_last_ping_latency = (time.monotonic() - t0) * 1000.0
+            CLOG.log_info("BRIDGE", "Подключен SSE-поток /events")
 
-            self._bridge_stop_event.wait(self._bridge_interval)
+            event_name = ""
+            data_lines: List[str] = []
+            while not self._bridge_stop_event.is_set():
+                raw_line = resp.readline()
+                if not raw_line:
+                    break
+                line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
+                if line.startswith(":"):
+                    # Keep-alive комментарий (: keepalive)
+                    self._bridge_consecutive_errors = 0
+                    continue
+                if line == "":
+                    if data_lines:
+                        raw_data = "\n".join(data_lines)
+                        if event_name in ("", "now_playing"):
+                            try:
+                                parsed = json.loads(raw_data)
+                                if isinstance(parsed, dict):
+                                    self._on_bridge_payload(parsed, "SSE")
+                            except Exception as pe:
+                                CLOG.log_warn("BRIDGE", f"SSE JSON parse error: {pe}")
+                    event_name = ""
+                    data_lines = []
+                    continue
+                if line.startswith("event:"):
+                    event_name = line[6:].strip()
+                elif line.startswith("data:"):
+                    val = line[5:]
+                    if val.startswith(" "):
+                        val = val[1:]
+                    data_lines.append(val)
+        except Exception as e:
+            if not self._bridge_stop_event.is_set():
+                CLOG.log_debug("BRIDGE", f"SSE поток отключен ({e}), переход в fallback")
+        finally:
+            self._bridge_sse_resp = None
+            if resp is not None:
+                try:
+                    resp.close()
+                except Exception:
+                    pass
+        return connected
+
+    def _bridge_worker(self):
+        while not self._bridge_stop_event.is_set():
+            was_sse_connected = self._bridge_sse_loop()
+            if self._bridge_stop_event.is_set():
+                break
+
+            if was_sse_connected:
+                # Короткая пауза перед переподключением SSE после разрыва потока
+                self._bridge_stop_event.wait(0.5)
+                continue
+
+            # Fallback на обычный polling (/now-playing) с периодической попыткой вернуться на SSE
+            poll_cycles = 0
+            while not self._bridge_stop_event.is_set() and poll_cycles < 25:
+                poll_cycles += 1
+                ok, data, dt_ping = self._bridge_poll_once()
+                self._bridge_last_ping_latency = dt_ping
+                if ok and isinstance(data, dict):
+                    self._on_bridge_payload(data, "Polling", dt_ping)
+                    self._bridge_stop_event.wait(self._bridge_interval)
+                else:
+                    self._bridge_consecutive_errors += 1
+                    self._bridge_mode = "Fallback"
+                    if self._bridge_consecutive_errors == 5:
+                        self._bridge_interval = 3.0
+                        CLOG.log_warn("BRIDGE", "5 ошибок связи подряд! Переход в ступенчатый backoff на 3.0 секунды")
+                    elif self._bridge_consecutive_errors > 5:
+                        self._bridge_interval = 3.0
+
+                    # Резервный файл sync.json
+                    fallback_data = self._read_fallback_sync_json()
+                    with self._bridge_lock:
+                        self._bridge_data = fallback_data
+
+                    self._bridge_stop_event.wait(self._bridge_interval)
+                    if self._bridge_consecutive_errors >= 5:
+                        break
 
     def _read_fallback_sync_json(self) -> Optional[Dict[str, Any]]:
         if not CLOG.base_dir:
@@ -1456,10 +1609,11 @@ class ClawdPetPlugin(BasePlugin):
             for i, ex in enumerate(exprs):
                 self._handler.postDelayed(R(lambda e=ex: self._set_expr(e, 1.0)), i * 600)
         elif index == 2:
-            status = "В бэкоффе (3.0с)" if self._bridge_consecutive_errors >= 5 else f"Активен ({self._bridge_interval*1000:.0f} мс)"
+            mode = self._bridge_mode
+            status = "В бэкоффе (3.0с)" if self._bridge_consecutive_errors >= 5 else f"{mode} ({self._bridge_interval*1000:.0f} мс)"
             errs = self._bridge_consecutive_errors
             ping = self._bridge_last_ping_latency
-            self._say(f"Bridge: {status}, пинг {ping:.1f}мс, ошибок: {errs}", force=True)
+            self._say(f"Bridge [{mode}]: {status}, пинг {ping:.1f}мс, ошибок: {errs}", force=True)
             self._hop(self._dp(400))
         elif index == 3:
             # Автономное демо караоке с виртуальным таймером
@@ -1537,8 +1691,8 @@ class ClawdPetPlugin(BasePlugin):
             report = (
                 f"=== ДАМП СИСТЕМЫ CLAWD v{__version__} ===\n"
                 f"Время: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-                f"Статус моста: errors={self._bridge_consecutive_errors}, interval={self._bridge_interval*1000:.0f}ms, latency={self._bridge_last_ping_latency:.1f}ms\n"
-                f"Текущий трек: {self._current_track_id}\n"
+                f"Статус моста: mode={self._bridge_mode}, errors={self._bridge_consecutive_errors}, interval={self._bridge_interval*1000:.0f}ms, latency={self._bridge_last_ping_latency:.1f}ms\n"
+                f"Текущий трек: {self._current_track_id} (speed={self._playback_speed:.2f}x)\n"
                 f"Смещение _user_offset: {self._user_offset:.3f} с\n"
                 f"Полнота желудка: {len(self._eaten)}/12 (стадия {self._fat_stage()})\n"
                 f"Батарея: {self._battery_level}% (зарядка={self._is_charging}, эконом={self._power_save_mode})\n"
@@ -1715,6 +1869,20 @@ class ClawdPetPlugin(BasePlugin):
 
     def _build_views(self, context):
         self._update_metrics()
+
+        aura_view = View(context)
+        aura_view.setClickable(False)
+        aura_view.setFocusable(False)
+        aura_view.setVisibility(View.GONE)
+        aura_w = int(self._w * 1.38)
+        aura_h = int(self._h * 1.38)
+        self._decor.addView(aura_view, FrameLayout.LayoutParams(aura_w, aura_h))
+        self._aura_view = aura_view
+        self._last_aura_color = None
+        self._last_aura_x = None
+        self._last_aura_y = None
+        self._last_aura_visible = False
+
         pet = ImageView(context)
         pet.setScaleType(ImageView.ScaleType.FIT_XY)
         pet.setClickable(True)
@@ -1732,6 +1900,33 @@ class ClawdPetPlugin(BasePlugin):
             AndroidUtilities.dp(12), AndroidUtilities.dp(7),
         )
         bubble_layout.setVisibility(View.GONE)
+
+        artwork_row = LinearLayout(context)
+        artwork_row.setOrientation(LinearLayout.HORIZONTAL)
+        artwork_row.setGravity(Gravity.CENTER_VERTICAL)
+        artwork_row.setPadding(0, 0, 0, AndroidUtilities.dp(5))
+        artwork_row.setVisibility(View.GONE)
+
+        artwork_view = ImageView(context)
+        artwork_view.setScaleType(ImageView.ScaleType.CENTER_CROP)
+        art_gd = GradientDrawable()
+        art_gd.setCornerRadius(float(AndroidUtilities.dp(7)))
+        art_gd.setColor(as_java_color(0x22FFFFFF))
+        artwork_view.setBackground(art_gd)
+        try:
+            artwork_view.setClipToOutline(True)
+        except Exception:
+            pass
+        art_sz = AndroidUtilities.dp(32)
+        artwork_row.addView(artwork_view, LinearLayout.LayoutParams(art_sz, art_sz))
+
+        artwork_title_tv = TextView(context)
+        artwork_title_tv.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 10.5)
+        artwork_title_tv.setTextColor(as_java_color(0xCCFFFFFF))
+        artwork_title_tv.setMaxLines(1)
+        artwork_title_tv.setPadding(AndroidUtilities.dp(8), 0, 0, 0)
+        artwork_row.addView(artwork_title_tv, LinearLayout.LayoutParams(0, -2, 1.0))
+        bubble_layout.addView(artwork_row, LinearLayout.LayoutParams(-1, -2))
 
         bubble_text = TextView(context)
         bubble_text.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 13.0)
@@ -1776,6 +1971,9 @@ class ClawdPetPlugin(BasePlugin):
 
         self._decor.addView(bubble_layout, FrameLayout.LayoutParams(-2, -2))
         self._bubble = bubble_layout
+        self._artwork_row = artwork_row
+        self._artwork_view = artwork_view
+        self._artwork_title_tv = artwork_title_tv
         self._bubble_text = bubble_text
         self._bubble_subtext = bubble_subtext
         self._media_controls_layout = controls
@@ -1783,17 +1981,43 @@ class ClawdPetPlugin(BasePlugin):
         self._frame_key = None
         self._pos_ready = False
 
+    def _clear_artwork(self):
+        if self._artwork_view is not None:
+            try:
+                self._artwork_view.setImageBitmap(None)
+            except Exception:
+                pass
+        if self._artwork_row is not None:
+            try:
+                self._artwork_row.setVisibility(View.GONE)
+            except Exception:
+                pass
+        old_art = self._artwork_bmp
+        self._artwork_bmp = None
+        self._artwork_track_key = None
+        if old_art is not None:
+            try:
+                old_art.recycle()
+            except Exception:
+                pass
+
     def _detach_views(self):
         self._restore_all()
         self._remove_poops()
         for view in list(self._particles):
             self._remove_view(view)
         self._particles = []
+        self._clear_artwork()
         self._remove_view(self._laser_view)
         self._remove_view(self._bubble)
         self._remove_view(self._pet)
+        self._remove_view(self._aura_view)
+        self._aura_view = None
         self._pet = None
         self._bubble = None
+        self._artwork_row = None
+        self._artwork_view = None
+        self._artwork_title_tv = None
         self._bubble_text = None
         self._bubble_subtext = None
         self._media_controls_layout = None
@@ -1805,6 +2029,11 @@ class ClawdPetPlugin(BasePlugin):
         self._platform = None
         self._platforms = []
         self._bubble_mode = None
+        self._last_bubble_accent = None
+        self._last_aura_color = None
+        self._last_aura_x = None
+        self._last_aura_y = None
+        self._last_aura_visible = False
         self._last_rendered_bmp = None
         self._last_rendered_frame_key = None
         for bmp in list(self._frames.values()):
@@ -1872,6 +2101,13 @@ class ClawdPetPlugin(BasePlugin):
         lp.width = self._w
         lp.height = self._h
         self._pet.setLayoutParams(lp)
+        if self._aura_view is not None:
+            alp = self._aura_view.getLayoutParams()
+            alp.width = int(self._w * 1.38)
+            alp.height = int(self._h * 1.38)
+            self._aura_view.setLayoutParams(alp)
+            self._last_aura_x = None
+            self._last_aura_y = None
         self._hop(self._dp(300))
         self._schedule(16)
 
@@ -2181,6 +2417,8 @@ class ClawdPetPlugin(BasePlugin):
         self._track_base_pos = 0.0
         self._track_base_time = 0.0
         self._track_is_playing = False
+        self._playback_speed = 1.0
+        self._accent_color = None
         self._user_offset = 0.0
         self._position_known = True
 
@@ -3139,6 +3377,35 @@ class ClawdPetPlugin(BasePlugin):
             self._last_rendered_rot = rotation
             self._pet.setRotation(float(rotation))
 
+        if self._aura_view is not None:
+            show_aura = self._media == "music" and self._accent_color is not None and self._state != "sleep"
+            if show_aura:
+                if not self._last_aura_visible:
+                    self._last_aura_visible = True
+                    self._aura_view.setVisibility(View.VISIBLE)
+                if self._last_aura_color != self._accent_color:
+                    self._last_aura_color = self._accent_color
+                    rgb = self._accent_color & 0x00FFFFFF
+                    agd = GradientDrawable()
+                    agd.setShape(GradientDrawable.OVAL)
+                    agd.setColor(as_java_color(rgb | 0x33000000))
+                    agd.setStroke(max(1, int(self._dp(2))), as_java_color(rgb | 0x88000000))
+                    self._aura_view.setBackground(agd)
+                ax = cur_x - (self._w * 0.19)
+                ay = cur_y - (self._h * 0.19)
+                if self._last_aura_x != ax:
+                    self._last_aura_x = ax
+                    self._aura_view.setTranslationX(float(ax))
+                if self._last_aura_y != ay:
+                    self._last_aura_y = ay
+                    self._aura_view.setTranslationY(float(ay))
+                pulse = 1.0 + (0.06 * abs(math.sin(now * math.pi * 2.0)) if self._track_is_playing else 0.0)
+                self._aura_view.setScaleX(float(pulse))
+                self._aura_view.setScaleY(float(pulse))
+            elif self._last_aura_visible:
+                self._last_aura_visible = False
+                self._aura_view.setVisibility(View.GONE)
+
     def _restore_position(self, min_x, max_x, min_y, max_y):
         fx = self.get_setting("pos_x", None)
         fy = self.get_setting("pos_y", None)
@@ -3551,7 +3818,56 @@ class ClawdPetPlugin(BasePlugin):
     def _get_current_track_pos(self, now: float) -> float:
         if not self._track_is_playing or self._track_base_time == 0.0:
             return self._track_base_pos
-        return self._track_base_pos + max(0.0, now - self._track_base_time)
+        return self._track_base_pos + max(0.0, now - self._track_base_time) * self._playback_speed
+
+    def _fetch_artwork_async(self, expected_track_id: str, track_label: str):
+        def _worker():
+            bmp = None
+            try:
+                req = urllib.request.Request(
+                    "http://127.0.0.1:44444/artwork",
+                    headers={
+                        "User-Agent": f"ClawdPet/{__version__} (Android)",
+                        "Host": "127.0.0.1:44444",
+                    },
+                )
+                with urllib.request.urlopen(req, timeout=1.5) as resp:
+                    if getattr(resp, "status", 200) == 200:
+                        raw = resp.read()
+                        if raw:
+                            jbytes = jarray(jbyte)(raw)
+                            bmp = BitmapFactory.decodeByteArray(jbytes, 0, len(raw))
+            except Exception:
+                bmp = None
+
+            def _apply():
+                if self._unloaded or self._current_track_id != expected_track_id or self._artwork_view is None:
+                    if bmp is not None:
+                        try:
+                            bmp.recycle()
+                        except Exception:
+                            pass
+                    return
+                old_bmp = self._artwork_bmp
+                self._artwork_bmp = bmp
+                if self._artwork_view is not None:
+                    self._artwork_view.setImageBitmap(bmp)
+                if self._artwork_title_tv is not None:
+                    self._artwork_title_tv.setText(track_label)
+                if self._artwork_row is not None:
+                    if bmp is not None and self._bubble_mode == "karaoke":
+                        self._artwork_row.setVisibility(View.VISIBLE)
+                    else:
+                        self._artwork_row.setVisibility(View.GONE)
+                if old_bmp is not None and old_bmp != bmp:
+                    try:
+                        old_bmp.recycle()
+                    except Exception:
+                        pass
+
+            run_on_ui_thread(_apply)
+
+        threading.Thread(target=_worker, daemon=True, name="clawd_artwork").start()
 
     def _poll_media(self, now):
         if now < self._media_check:
@@ -3564,6 +3880,10 @@ class ClawdPetPlugin(BasePlugin):
         duration_ms = 0
         is_playing = False
         position_known = True
+        playback_speed = 1.0
+        bridge_rx_mono = 0.0
+        accent_color: Optional[int] = None
+        has_artwork = False
 
         # Проверка окончания тестового режима караоке и приоритета реального воспроизведения
         tg_playing_now = False
@@ -3611,9 +3931,11 @@ class ClawdPetPlugin(BasePlugin):
         # 2.1 Приоритеты источников звука:
         # Telegram Playing -> Clawd Bridge Playing -> Telegram Paused -> Clawd Bridge Paused
         tg_playing = tg_playing_now
+        used_bridge = False
         if self._cfg.get("dance", True):
             if not tg_playing:
                 if bridge_snapshot and bridge_snapshot.get("has_media") and bridge_snapshot.get("is_playing"):
+                    used_bridge = True
                     kind = "music"
                     is_playing = True
                     player_name = str(bridge_snapshot.get("player") or "Bridge")
@@ -3622,6 +3944,13 @@ class ClawdPetPlugin(BasePlugin):
                     track_position_ms = int(bridge_snapshot.get("position_ms") or 0)
                     duration_ms = int(bridge_snapshot.get("duration_ms") or 0)
                     position_known = bool(bridge_snapshot.get("position_known", True))
+                    try:
+                        playback_speed = clamp(float(bridge_snapshot.get("playback_speed") or 1.0), 0.25, 4.0)
+                    except Exception:
+                        playback_speed = 1.0
+                    bridge_rx_mono = float(bridge_snapshot.get("_received_mono") or 0.0)
+                    accent_color = parse_hex_color(bridge_snapshot.get("accent_color"))
+                    has_artwork = bool(bridge_snapshot.get("has_artwork", False))
                 elif tg_paused_music is not None:
                     kind = "music"
                     is_playing = False
@@ -3634,6 +3963,7 @@ class ClawdPetPlugin(BasePlugin):
                     track_position_ms = int(dur_sec * prog * 1000)
                     position_known = True
                 elif bridge_snapshot and bridge_snapshot.get("has_media"):
+                    used_bridge = True
                     kind = "music"
                     is_playing = False
                     player_name = str(bridge_snapshot.get("player") or "Bridge")
@@ -3642,6 +3972,21 @@ class ClawdPetPlugin(BasePlugin):
                     track_position_ms = int(bridge_snapshot.get("position_ms") or 0)
                     duration_ms = int(bridge_snapshot.get("duration_ms") or 0)
                     position_known = bool(bridge_snapshot.get("position_known", True))
+                    try:
+                        playback_speed = clamp(float(bridge_snapshot.get("playback_speed") or 1.0), 0.25, 4.0)
+                    except Exception:
+                        playback_speed = 1.0
+                    bridge_rx_mono = float(bridge_snapshot.get("_received_mono") or 0.0)
+                    accent_color = parse_hex_color(bridge_snapshot.get("accent_color"))
+                    has_artwork = bool(bridge_snapshot.get("has_artwork", False))
+
+        if kind == "music":
+            if self._accent_color != accent_color:
+                self._accent_color = accent_color
+                if self._bubble_visible and self._bubble_mode == "karaoke":
+                    self._apply_karaoke_bubble_style()
+        else:
+            self._accent_color = None
 
         if track_title:
             clean_a, clean_t = self._lyrics_helper.clean_metadata(track_artist, track_title)
@@ -3649,6 +3994,7 @@ class ClawdPetPlugin(BasePlugin):
             self._last_active_clean_t = clean_t
             # Смена трека фиксируется строго по тройке (player, artist, title)
             triplet_id = f"{player_name}::{clean_a}::{clean_t}"
+            art_key = f"{clean_a}::{clean_t}"
             if triplet_id != self._current_track_id:
                 self._current_track_id = triplet_id
                 self._lyrics_timeline = []
@@ -3656,6 +4002,7 @@ class ClawdPetPlugin(BasePlugin):
                 self._is_singing = False
                 self._lyrics_retry_count = 0
                 self._last_lyrics_retry = 0.0
+                self._clear_artwork()
 
                 # Из памяти сессии извлекается сохранённый сдвиг _user_offset для данного трека
                 track_offset_key = f"{clean_a} - {clean_t}"
@@ -3663,12 +4010,17 @@ class ClawdPetPlugin(BasePlugin):
 
                 CLOG.log_info(
                     "TRACK",
-                    f"Смена трека: '{clean_a}' — '{clean_t}' (player={player_name}, offset={self._user_offset:.3f}с)",
+                    f"Смена трека: '{clean_a}' — '{clean_t}' (player={player_name}, speed={playback_speed:.2f}x, offset={self._user_offset:.3f}с)",
                     player=player_name,
                     artist=clean_a,
                     title=clean_t,
                     offset=f"{self._user_offset:.3f}",
                 )
+
+                if used_bridge and has_artwork and self._artwork_track_key != art_key:
+                    self._artwork_track_key = art_key
+                    label = f"{clean_a} — {clean_t}" if clean_a else clean_t
+                    self._fetch_artwork_async(triplet_id, label)
 
                 # Треки без автора длительностью < 30 с считаются рекламой
                 is_ad = (not clean_a) and (0 < duration_ms < 30000)
@@ -3717,16 +4069,28 @@ class ClawdPetPlugin(BasePlugin):
 
                     self._lyrics_helper.get_lyrics_async(clean_a, clean_t, _on_retry_loaded)
 
-        # 2.2 Математика синхронизации и сдвига
+        # 2.2 Математика синхронизации и сдвига (с учётом playback_speed и времени доставки SSE)
         self._position_known = position_known
         if kind == "music":
             # 1.2 Компенсация задержки передачи моста: Δ_comp = 0.22 с
-            if not tg_playing and tg_paused_music is None:
+            if used_bridge:
                 t_new = (track_position_ms / 1000.0) + 0.22
+                if is_playing and bridge_rx_mono > 0.0:
+                    t_new += max(0.0, now - bridge_rx_mono) * playback_speed
             else:
                 t_new = track_position_ms / 1000.0
             t_calc = self._get_current_track_pos(now)
             drift = abs(t_new - t_calc)
+            speed_changed = abs(playback_speed - self._playback_speed) > 0.01
+            sse_fresh_event = bool(
+                used_bridge
+                and bridge_snapshot is not None
+                and bridge_snapshot.get("_is_sse_event")
+                and bridge_rx_mono > 0.0
+                and bridge_rx_mono != self._last_sse_rx_mono
+            )
+            if sse_fresh_event:
+                self._last_sse_rx_mono = bridge_rx_mono
 
             # 1.2 Отслеживание перехода пауза -> возобновление (resumed)
             was_paused = not self._track_is_playing
@@ -3736,33 +4100,38 @@ class ClawdPetPlugin(BasePlugin):
                 # Пауза: значение T_calc замораживается на месте
                 self._track_is_playing = False
                 self._is_singing = False
+                self._playback_speed = playback_speed
                 self._track_base_pos = t_calc
                 self._track_base_time = now
                 if self._handler and self._karaoke_switch_r:
                     self._handler.removeCallbacks(self._karaoke_switch_r)
             else:
                 self._track_is_playing = True
+                self._playback_speed = playback_speed
                 # База времени пересчитывается строго при:
                 # 1) Реальной ручной перемотке трека пользователем: drift > 1.2;
                 # 2) Первичном старте трека: _track_base_time == 0.0;
-                # 3) Возобновлении воспроизведения после паузы: resumed == True.
-                if drift > 1.2 or self._track_base_time == 0.0 or resumed:
+                # 3) Возобновлении воспроизведения после паузы: resumed == True;
+                # 4) Изменении скорости воспроизведения или свежем SSE-событии (смена/перемотка).
+                if drift > 1.2 or self._track_base_time == 0.0 or resumed or speed_changed or sse_fresh_event:
                     CLOG.log_debug(
                         "JITTER",
-                        f"Обновление базы: drift={drift*1000:.0f}мс resumed={resumed}",
+                        f"Обновление базы: drift={drift*1000:.0f}мс resumed={resumed} sse={sse_fresh_event} speed={playback_speed:.2f}x",
                         drift_ms=f"{drift*1000:.0f}",
                         resumed=resumed,
                     )
                     self._track_base_pos = t_new
                     self._track_base_time = now
                     # Немедленный перерасчет таймера караоке
-                    if resumed:
+                    if resumed or self._bubble_mode != "karaoke":
                         self._current_lyric_idx = -1
+                    if resumed or sse_fresh_event:
                         self._do_karaoke_line_switch()
                     else:
                         self._reschedule_karaoke_switch()
         else:
             self._track_is_playing = False
+            self._playback_speed = 1.0
 
         if kind == self._media:
             return
@@ -3776,6 +4145,9 @@ class ClawdPetPlugin(BasePlugin):
             self._lyrics_retry_count = 0
             self._track_base_pos = 0.0
             self._track_base_time = 0.0
+            self._playback_speed = 1.0
+            self._accent_color = None
+            self._clear_artwork()
             self._hide_bubble()
             if self._handler and self._karaoke_switch_r:
                 self._handler.removeCallbacks(self._karaoke_switch_r)
@@ -3850,7 +4222,8 @@ class ClawdPetPlugin(BasePlugin):
         else:
             wake_at = t_karaoke + 4.0
 
-        delay_ms = max(30, int((wake_at - t_karaoke) * 1000.0))
+        speed = max(0.25, self._playback_speed)
+        delay_ms = max(30, int(((wake_at - t_karaoke) / speed) * 1000.0))
         self._handler.postDelayed(self._karaoke_switch_r, delay_ms)
 
     def _do_karaoke_line_switch(self):
@@ -3959,17 +4332,30 @@ class ClawdPetPlugin(BasePlugin):
             view.setTranslationY(0.0)
             view.setAlpha(target_alpha)
 
+    def _apply_karaoke_bubble_style(self):
+        if self._bubble is None:
+            return
+        self._last_bubble_accent = self._accent_color
+        bg = GradientDrawable()
+        bg.setCornerRadius(float(self._dp(13)))
+        if self._accent_color is not None:
+            tinted = (mix_color(0xFF1A1A1E, self._accent_color, 0.16) & 0x00FFFFFF) | 0xEE000000
+            stroke_c = (self._accent_color & 0x00FFFFFF) | 0xCC000000
+            bg.setColor(as_java_color(tinted))
+            bg.setStroke(max(1, int(self._dp(1.5))), as_java_color(stroke_c))
+        else:
+            bg.setColor(as_java_color(0xEE1A1A1E))
+            bg.setStroke(max(1, int(self._dp(1))), as_java_color(0x33FFFFFF))
+        self._bubble.setBackground(bg)
+
     def _show_karaoke_line(self, current_text: str, next_text: str, now: float):
         if self._bubble is None or self._bubble_text is None:
             return
         try:
+            if self._bubble_mode != "karaoke" or self._last_bubble_accent != self._accent_color:
+                self._apply_karaoke_bubble_style()
             if self._bubble_mode != "karaoke":
                 self._bubble_mode = "karaoke"
-                bg = GradientDrawable()
-                bg.setCornerRadius(float(self._dp(13)))
-                bg.setColor(as_java_color(0xEE1A1A1E))
-                bg.setStroke(max(1, int(self._dp(1))), as_java_color(0x33FFFFFF))
-                self._bubble.setBackground(bg)
 
                 # 2.2 Стабилизация караоке-виджета: фиксированная геометрия 210-260 dp
                 self._bubble.setMinimumWidth(AndroidUtilities.dp(210))
@@ -3986,6 +4372,9 @@ class ClawdPetPlugin(BasePlugin):
                     self._bubble_subtext.setMaxWidth(AndroidUtilities.dp(260))
                     self._bubble_subtext.setGravity(Gravity.CENTER_HORIZONTAL)
                     self._bubble_subtext.setLayoutParams(LinearLayout.LayoutParams(-1, -2))
+
+            if self._artwork_row is not None:
+                self._artwork_row.setVisibility(View.VISIBLE if self._artwork_bmp is not None else View.GONE)
 
             self._bubble_text.setTextColor(as_java_color(0xFFFFFFFF))
             self._animate_text_change(self._bubble_text, current_text, target_alpha=1.0)
@@ -4150,6 +4539,8 @@ class ClawdPetPlugin(BasePlugin):
                     self._bubble_text.setGravity(Gravity.NO_GRAVITY)
                     self._bubble_text.setLayoutParams(LinearLayout.LayoutParams(-2, -2))
                     self._bubble_text.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlackText))
+                if self._artwork_row is not None:
+                    self._artwork_row.setVisibility(View.GONE)
                 if self._bubble_subtext is not None:
                     self._bubble_subtext.setVisibility(View.GONE)
                 if self._media_controls_layout is not None:
@@ -4232,7 +4623,12 @@ class ClawdPetPlugin(BasePlugin):
                 pass
 
             # Исключение: собственные элементы плагина
-            if view.equals(self._pet) or view.equals(self._bubble) or (self._laser_view is not None and view.equals(self._laser_view)):
+            if (
+                view.equals(self._pet)
+                or view.equals(self._bubble)
+                or (self._aura_view is not None and view.equals(self._aura_view))
+                or (self._laser_view is not None and view.equals(self._laser_view))
+            ):
                 continue
             if any(view.equals(p) for p in self._poops) or any(view.equals(pt) for pt in self._particles):
                 continue

@@ -223,3 +223,39 @@ test('Clawd v3.5 satisfies all requirements from ТЗ v3.5', () => {
     '4.3: Время жизни кэша платформ 500 мс с заморозкой в idle/sleep'
   );
 });
+
+test('Clawd Bridge SSE, playback_speed, artwork and accent_color support', () => {
+  const filePath = path.resolve(process.cwd(), 'public/clawd_v3_4.py');
+  const code = fs.readFileSync(filePath, 'utf-8');
+
+  assert.ok(
+    code.includes('http://127.0.0.1:44444/events') &&
+    code.includes('text/event-stream') &&
+    code.includes('line.startswith(":")'),
+    'SSE: /events stream with keepalive comment ignoring required'
+  );
+  assert.ok(
+    code.includes('http://127.0.0.1:44444/now-playing') &&
+    code.includes('_bridge_poll_once'),
+    'SSE: Fallback polling to /now-playing required'
+  );
+  assert.ok(
+    code.includes('playback_speed') &&
+    code.includes('_received_mono') &&
+    code.includes('* self._playback_speed'),
+    'Playback speed extrapolation with local receive timestamp required'
+  );
+  assert.ok(
+    code.includes('http://127.0.0.1:44444/artwork') &&
+    code.includes('has_artwork') &&
+    code.includes('BitmapFactory.decodeByteArray'),
+    'Artwork: /artwork fetch on track change when has_artwork is true'
+  );
+  assert.ok(
+    code.includes('accent_color') &&
+    code.includes('parse_hex_color') &&
+    code.includes('_aura_view'),
+    'Accent color: #RRGGBB parsing and UI/aura highlighting required'
+  );
+});
+
