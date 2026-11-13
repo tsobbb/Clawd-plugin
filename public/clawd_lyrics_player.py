@@ -6,6 +6,7 @@ import os
 import queue
 import random
 import re
+import socket
 import threading
 import time
 import traceback
@@ -347,6 +348,22 @@ class ClaudeLogger:
         except Exception as e:
             self.log_error("LYRICS", f"Ошибка архивации текста: {e}")
 
+    def delete_lyrics_archive(self, artist: str, title: str) -> bool:
+        if not self.lyrics_dir:
+            return False
+        safe = re.sub(r'[\\/*?:"<>|]', "", f"{artist} - {title}").strip()[:60]
+        removed = False
+        for ext in (".txt", ".lrc"):
+            fp = os.path.join(self.lyrics_dir, f"{safe}{ext}")
+            if os.path.exists(fp):
+                try:
+                    os.remove(fp)
+                    removed = True
+                    self.log_info("LYRICS", f"Удален неверный архив слов: {safe}{ext}")
+                except Exception:
+                    pass
+        return removed
+
 
 CLOG = ClaudeLogger()
 
@@ -431,10 +448,17 @@ class BubbleScaleSeekListener(dynamic_proxy(SeekBar.OnSeekBarChangeListener)):
 
 # === [SHARED_BLOCK:LYRICS_HELPER] ===
 class LyricsHelper:
-    """Караоке, SoundCloud oEmbed и локальный архив LRCLIB / NetEase."""
+    """Караоке, SoundCloud oEmbed и локальный архив LRCLIB / NetEase с проверкой длительности."""
+
+    _VERSION_TAGS = (
+        "slowed", "reverb", "sped up", "speed up", "nightcore", "remix",
+        "instrumental", "karaoke", "cover", "8d", "mashup", "acoustic", "live",
+        "pitched", "bass boosted", "lo-fi", "lofi",
+    )
 
     def __init__(self, logger_cb=None):
         self.cache: Dict[Tuple[str, str], List[Tuple[float, str]]] = {}
+        self.meta: Dict[Tuple[str, str], Dict[str, Any]] = {}
         self.lock = threading.Lock()
         self.loading = set()
         self.logger_cb = logger_cb
@@ -482,10 +506,88 @@ class LyricsHelper:
         return a.strip(" -_()[]{}'\""), t.strip(" -_()[]{}'\"")
 
     @staticmethod
+    def _norm_cmp(s: str) -> str:
+        s = re.sub(r"\(.*?\)|\[.*?\]", " ", (s or "").lower())
+        s = re.sub(r"[^\w\s]", " ", s, flags=re.U)
+        return re.sub(r"\s+", " ", s).strip()
+
+    @classmethod
+    def _score_candidate(
+        cls,
+        cand_artist: str,
+        cand_title: str,
+        cand_dur_sec: float,
+        exp_artist: str,
+        exp_title: str,
+        exp_dur_sec: float,
+        source_name: str,
+    ) -> float:
+        score = 0.0
+        ca = cls._norm_cmp(cand_artist)
+        ct = cls._norm_cmp(cand_title)
+        ea = cls._norm_cmp(exp_artist)
+        et = cls._norm_cmp(exp_title)
+
+        # Название трека (главный вес)
+        if et and ct:
+            if ct == et:
+                score += 60.0
+            elif et in ct or ct in et:
+                score += 36.0
+            else:
+                e_words = set(et.split())
+                c_words = set(ct.split())
+                overlap = len(e_words & c_words)
+                if overlap > 0:
+                    score += 24.0 * (overlap / max(1, len(e_words)))
+                else:
+                    score -= 70.0
+        elif not ct:
+            score -= 50.0
+
+        # Штраф за ремиксы / slowed / nightcore / инструменталы если их нет в названии трека
+        ct_raw = (cand_title or "").lower()
+        et_raw = (exp_title or "").lower()
+        for tag in cls._VERSION_TAGS:
+            if tag in ct_raw and tag not in et_raw:
+                score -= 38.0
+
+        # Исполнитель
+        if ea and ca:
+            if ca == ea or ea in ca or ca in ea:
+                score += 40.0
+            else:
+                e_aw = set(ea.split())
+                c_aw = set(ca.split())
+                overlap_a = len(e_aw & c_aw)
+                if overlap_a > 0:
+                    score += 22.0 * (overlap_a / max(1, len(e_aw)))
+                else:
+                    score -= 45.0
+
+        # Длительность трека (ключевая защита от ремиксов и чужих версий)
+        if exp_dur_sec > 15.0 and cand_dur_sec > 15.0:
+            diff = abs(cand_dur_sec - exp_dur_sec)
+            if diff <= 3.0:
+                score += 50.0
+            elif diff <= 8.0:
+                score += 30.0
+            elif diff <= 15.0:
+                score += 10.0
+            elif diff <= 28.0:
+                score -= 25.0
+            else:
+                score -= 90.0
+
+        if source_name == "LRCLIB":
+            score += 4.0
+        return score
+
+    @staticmethod
     def parse_lrc(lrc_text: str) -> List[Tuple[float, str]]:
         if not lrc_text:
             return []
-        timeline = []
+        raw_timeline: List[Tuple[float, str]] = []
         offset_sec = 0.0
 
         offset_match = re.search(r"\[offset:\s*([+-]?\d+)\]", lrc_text, re.I)
@@ -496,14 +598,17 @@ class LyricsHelper:
                 offset_sec = 0.0
 
         time_tag_regex = re.compile(r"\[(\d{1,2}):(\d{2})(?:[.:](\d{1,3}))?\]")
+        inline_word_tag = re.compile(r"<\d{1,2}:\d{2}(?:[.:]\d{1,3})?>")
         for raw_line in lrc_text.splitlines():
             line = raw_line.strip()
-            if not line or line.startswith(("[ti:", "[ar:", "[al:", "[by:", "[re:", "[ve:")):
+            if not line or line.startswith(("[ti:", "[ar:", "[al:", "[by:", "[re:", "[ve:", "[length:")):
                 continue
             matches = list(time_tag_regex.finditer(line))
             if not matches:
                 continue
-            text = time_tag_regex.sub("", line).strip()
+            text = time_tag_regex.sub("", line)
+            text = inline_word_tag.sub("", text)
+            text = re.sub(r"\s{2,}", " ", text).strip()
             if not text:
                 continue
             for m in matches:
@@ -511,12 +616,24 @@ class LyricsHelper:
                 ms_str = m.group(3)
                 frac = float(f"0.{ms_str}") if ms_str else 0.0
                 t_sec = max(0.0, mm * 60.0 + ss + frac + offset_sec)
-                timeline.append((t_sec, text))
+                raw_timeline.append((t_sec, text))
 
-        timeline.sort(key=lambda x: x[0])
+        raw_timeline.sort(key=lambda x: x[0])
+
+        # Дедупликация строк с одинаковым таймингом (например, перевод в NetEase/LRCLIB)
+        timeline: List[Tuple[float, str]] = []
+        for t_sec, text in raw_timeline:
+            if timeline and abs(t_sec - timeline[-1][0]) < 0.04:
+                prev_text = timeline[-1][1]
+                # Оставляем первую непустую строку, если новая дубликат или перевод-комментарий
+                if text == prev_text or not prev_text:
+                    if not prev_text:
+                        timeline[-1] = (t_sec, text)
+                continue
+            timeline.append((t_sec, text))
         return timeline
 
-    def _req(self, url: str) -> Optional[dict]:
+    def _req(self, url: str) -> Optional[Any]:
         try:
             req = urllib.request.Request(
                 url, headers={"User-Agent": "Mozilla/5.0 (Android; ClawdKaraoke/3.5)"}
@@ -552,42 +669,147 @@ class LyricsHelper:
             pass
         return None
 
-    def fetch_lrclib(self, artist: str, title: str) -> Optional[str]:
+    def fetch_lrclib_candidates(self, artist: str, title: str, duration_ms: int = 0) -> List[Dict[str, Any]]:
+        exp_dur_sec = float(duration_ms) / 1000.0 if duration_ms and duration_ms > 1000 else 0.0
+        candidates: List[Dict[str, Any]] = []
+        seen_lrc = set()
+
+        def _add_item(item: Any, boost: float = 0.0):
+            if not isinstance(item, dict):
+                return
+            lrc = item.get("syncedLyrics")
+            if not lrc or "[" not in lrc:
+                return
+            sig = lrc[:120]
+            if sig in seen_lrc:
+                return
+            seen_lrc.add(sig)
+            ca = str(item.get("artistName") or artist or "")
+            ct = str(item.get("trackName") or title or "")
+            cdur = float(item.get("duration") or 0.0)
+            sc = self._score_candidate(ca, ct, cdur, artist, title, exp_dur_sec, "LRCLIB") + boost
+            candidates.append({
+                "source": "LRCLIB",
+                "artist": ca,
+                "title": ct,
+                "duration": cdur,
+                "lrc": lrc,
+                "score": sc,
+            })
+
         if artist:
             qa, qt = urllib.parse.quote(artist), urllib.parse.quote(title)
-            data = self._req(f"https://lrclib.net/api/get?artist_name={qa}&track_name={qt}")
-            if data and data.get("syncedLyrics"):
-                return data.get("syncedLyrics")
+            dur_q = f"&duration={int(round(exp_dur_sec))}" if exp_dur_sec > 15.0 else ""
+            data = self._req(f"https://lrclib.net/api/get?artist_name={qa}&track_name={qt}{dur_q}")
+            _add_item(data, boost=12.0)
 
         query = urllib.parse.quote(f"{artist} {title}".strip())
         results = self._req(f"https://lrclib.net/api/search?q={query}")
         if isinstance(results, list):
             for item in results:
-                if item.get("syncedLyrics"):
-                    return item.get("syncedLyrics")
-        return None
+                _add_item(item)
 
-    def fetch_netease(self, artist: str, title: str) -> Optional[str]:
+        if not candidates and artist and title:
+            qt_only = urllib.parse.quote(title)
+            results2 = self._req(f"https://lrclib.net/api/search?track_name={qt_only}")
+            if isinstance(results2, list):
+                for item in results2:
+                    _add_item(item)
+
+        candidates.sort(key=lambda c: c["score"], reverse=True)
+        return candidates[:8]
+
+    def fetch_lrclib(self, artist: str, title: str, duration_ms: int = 0) -> Optional[str]:
+        cands = self.fetch_lrclib_candidates(artist, title, duration_ms=duration_ms)
+        if not cands:
+            return None
+        best = cands[0]
+        if duration_ms > 15000 and best["score"] < -15.0:
+            CLOG.log_warn(
+                "LYRICS",
+                f"LRCLIB отклонен из-за несовпадения (score={best['score']:.1f}, match='{best['artist']} - {best['title']}', dur={best['duration']:.0f}s vs track={duration_ms/1000.0:.0f}s)",
+            )
+            return None
+        return best["lrc"]
+
+    def fetch_netease_candidates(self, artist: str, title: str, duration_ms: int = 0) -> List[Dict[str, Any]]:
+        exp_dur_sec = float(duration_ms) / 1000.0 if duration_ms and duration_ms > 1000 else 0.0
+        candidates: List[Dict[str, Any]] = []
+        seen_ids = set()
+
         for q_str in (f"{artist} {title}".strip(), title.strip()):
             if not q_str:
                 continue
             query = urllib.parse.quote(q_str)
-            data = self._req(f"https://music.163.com/api/search/get?s={query}&type=1&limit=3")
+            data = self._req(f"https://music.163.com/api/search/get?s={query}&type=1&limit=5")
             if not data:
                 continue
             songs = data.get("result", {}).get("songs", [])
+            scored_songs = []
             for song in songs:
                 song_id = song.get("id")
-                if not song_id:
+                if not song_id or song_id in seen_ids:
+                    continue
+                seen_ids.add(song_id)
+                ca = ", ".join(str(ar.get("name") or "") for ar in (song.get("artists") or []) if isinstance(ar, dict))
+                ct = str(song.get("name") or "")
+                cdur = float(song.get("duration") or 0.0) / 1000.0
+                sc = self._score_candidate(ca, ct, cdur, artist, title, exp_dur_sec, "NETEASE")
+                scored_songs.append((sc, song_id, ca, ct, cdur))
+
+            scored_songs.sort(key=lambda x: x[0], reverse=True)
+            for sc, song_id, ca, ct, cdur in scored_songs[:3]:
+                if sc < -35.0:
                     continue
                 ldata = self._req(f"https://music.163.com/api/song/lyric?id={song_id}&lv=1&kv=1&tv=-1")
                 if ldata:
                     lrc = ldata.get("lrc", {}).get("lyric")
                     if lrc and "[" in lrc:
-                        return lrc
-        return None
+                        candidates.append({
+                            "source": "NETEASE",
+                            "artist": ca,
+                            "title": ct,
+                            "duration": cdur,
+                            "lrc": lrc,
+                            "score": sc,
+                        })
+            if candidates:
+                break
 
-    def get_lyrics_async(self, artist: str, title: str, callback):
+        candidates.sort(key=lambda c: c["score"], reverse=True)
+        return candidates[:6]
+
+    def fetch_netease(self, artist: str, title: str, duration_ms: int = 0) -> Optional[str]:
+        cands = self.fetch_netease_candidates(artist, title, duration_ms=duration_ms)
+        return cands[0]["lrc"] if cands else None
+
+    def get_lyrics_meta(self, artist: str, title: str) -> Dict[str, Any]:
+        clean_a, clean_t = self.clean_metadata(artist, title)
+        key = (clean_a.lower(), clean_t.lower())
+        with self.lock:
+            return dict(self.meta.get(key) or {})
+
+    def apply_manual_candidate(self, artist: str, title: str, cand: Dict[str, Any]) -> List[Tuple[float, str]]:
+        clean_a, clean_t = self.clean_metadata(artist, title)
+        key = (clean_a.lower(), clean_t.lower())
+        lrc = cand.get("lrc") or ""
+        timeline = self.parse_lrc(lrc)
+        if timeline:
+            CLOG.save_lyrics_archive(clean_a, clean_t, lrc)
+            with self.lock:
+                self.cache[key] = timeline
+                meta = dict(self.meta.get(key) or {})
+                meta.update({
+                    "source": cand.get("source", "MANUAL"),
+                    "matched_artist": cand.get("artist", clean_a),
+                    "matched_title": cand.get("title", clean_t),
+                    "duration_sec": float(cand.get("duration") or 0.0),
+                    "lines": len(timeline),
+                })
+                self.meta[key] = meta
+        return timeline
+
+    def get_lyrics_async(self, artist: str, title: str, callback, duration_ms: int = 0, force_refresh: bool = False):
         clean_a, clean_t = self.clean_metadata(artist, title)
         if not clean_t:
             callback([])
@@ -595,7 +817,10 @@ class LyricsHelper:
 
         key = (clean_a.lower(), clean_t.lower())
         with self.lock:
-            if key in self.cache:
+            if force_refresh:
+                self.cache.pop(key, None)
+                self.meta.pop(key, None)
+            elif key in self.cache:
                 callback(self.cache[key])
                 return
             if key in self.loading:
@@ -604,26 +829,55 @@ class LyricsHelper:
 
         def _worker():
             try:
+                exp_dur_sec = float(duration_ms) / 1000.0 if duration_ms and duration_ms > 1000 else 0.0
+                if force_refresh:
+                    CLOG.delete_lyrics_archive(clean_a, clean_t)
+
                 # 1. Проверяем локальный архив на диске
-                cached_text = CLOG.check_lyrics_archive(clean_a, clean_t)
+                cached_text = None if force_refresh else CLOG.check_lyrics_archive(clean_a, clean_t)
                 source_tag = "ARCHIVE"
                 lrc = cached_text
+                matched_cand: Optional[Dict[str, Any]] = None
+                all_cands: List[Dict[str, Any]] = []
 
                 if not lrc:
-                    self._log(f"Поиск слов в сети: '{clean_a}' — '{clean_t}'")
-                    lrc = self.fetch_lrclib(clean_a, clean_t)
-                    source_tag = "LRCLIB"
-                    if not lrc:
-                        lrc = self.fetch_netease(clean_a, clean_t)
-                        source_tag = "NETEASE"
+                    self._log(f"Поиск слов: '{clean_a}' — '{clean_t}' (dur={exp_dur_sec:.0f}с)")
+                    lrclib_cands = self.fetch_lrclib_candidates(clean_a, clean_t, duration_ms=duration_ms)
+                    netease_cands = []
+                    if not lrclib_cands or lrclib_cands[0]["score"] < 45.0:
+                        netease_cands = self.fetch_netease_candidates(clean_a, clean_t, duration_ms=duration_ms)
+                    all_cands = sorted(lrclib_cands + netease_cands, key=lambda c: c["score"], reverse=True)
+                    if all_cands:
+                        best = all_cands[0]
+                        if exp_dur_sec <= 15.0 or best["score"] >= -15.0:
+                            matched_cand = best
+                            lrc = best["lrc"]
+                            source_tag = best["source"]
+                        else:
+                            CLOG.log_warn("LYRICS", f"Все найденные LRC отклонены по score ({best['score']:.1f})")
                     if lrc:
                         CLOG.save_lyrics_archive(clean_a, clean_t, lrc)
 
                 timeline = self.parse_lrc(lrc) if lrc else []
+                lrc_last_t = timeline[-1][0] if timeline else 0.0
+                meta_obj = {
+                    "source": source_tag,
+                    "matched_artist": matched_cand.get("artist", clean_a) if matched_cand else clean_a,
+                    "matched_title": matched_cand.get("title", clean_t) if matched_cand else clean_t,
+                    "duration_sec": (matched_cand.get("duration") or lrc_last_t) if matched_cand else lrc_last_t,
+                    "query_dur_sec": exp_dur_sec,
+                    "score": matched_cand.get("score", 0.0) if matched_cand else 0.0,
+                    "lines": len(timeline),
+                    "candidates": all_cands,
+                }
                 with self.lock:
+                    self.meta[key] = meta_obj
                     if timeline:
                         self.cache[key] = timeline
-                self._log(f"Загружено строк ({source_tag}) для '{clean_t}': {len(timeline)}")
+                self._log(
+                    f"Загружено строк ({source_tag}) для '{clean_t}': {len(timeline)} "
+                    f"(LRC~{meta_obj['duration_sec']:.0f}с / трек~{exp_dur_sec:.0f}с)"
+                )
                 callback(timeline)
             except Exception as e:
                 CLOG.log_error("LYRICS", f"Ошибка получения слов для '{clean_t}'", e)
@@ -707,6 +961,7 @@ class ClawdLyricsPlugin(BasePlugin):
         self._artwork_last_has_flag = False
         self._bubble_text = None
         self._bubble_subtext = None
+        self._sync_debug_tv = None
         self._media_controls_layout = None
         self._media_ctrl_btns = []
         self._bubble_touch_listener = None
@@ -739,6 +994,7 @@ class ClawdLyricsPlugin(BasePlugin):
         self._last_failsafe_check = 0.0
         self._last_active_clean_a = ""
         self._last_active_clean_t = ""
+        self._active_duration_ms = 0
 
         self._anchor_pos_ms = 0.0
         self._anchor_mono = 0.0
@@ -752,6 +1008,17 @@ class ClawdLyricsPlugin(BasePlugin):
         self._user_offset = 0.0
         self._session_offsets: Dict[str, float] = {}
         self._position_known = True
+        self._text_anim_seq: Dict[int, int] = {}
+        self._sync_trace_log = collections.deque(maxlen=40)
+        self._last_sync_source = "NONE"
+        self._last_sync_delta_ms = 0.0
+        self._last_raw_pos_ms = 0
+        self._last_bridge_raw_pos_ms = -1
+        self._last_bridge_raw_rx_mono = 0.0
+        self._last_tg_raw_pos_ms = -1
+        self._bridge_back_snap_streak = 0
+        self._last_hud_upd = 0.0
+        self._last_hud_text = ""
 
         self._media = None
         self._media_check = 0.0
@@ -1137,6 +1404,14 @@ class ClawdLyricsPlugin(BasePlugin):
                 on_change=lambda v: self._on_cfg_change("show_on_pause", v),
             ),
             Switch(
+                key="sync_debug_hud",
+                text="Отладка синхронизации (HUD)",
+                default=False,
+                subtext="Показывать SRC, raw/calc, Δms и источник LRC прямо под текстом",
+                icon="msg_diagnostic",
+                on_change=lambda v: self._on_cfg_change("sync_debug_hud", v),
+            ),
+            Switch(
                 key="clipboard_sync",
                 text="Автоперехват из буфера (SoundCloud)",
                 default=False,
@@ -1160,7 +1435,7 @@ class ClawdLyricsPlugin(BasePlugin):
             ),
             Text(
                 text="Скопировать отчёт системы 📋",
-                subtext="Дамп статуса Bridge, настроек и последних 200 строк лога",
+                subtext="Дамп моста, LRC-метаданных, трассировки синхронизации и лога",
                 icon="msg_copy",
                 on_click=lambda _v=None: run_on_ui_thread(self._copy_system_report),
             ),
@@ -1216,15 +1491,21 @@ class ClawdLyricsPlugin(BasePlugin):
             cm = ctx.getSystemService(Context.CLIPBOARD_SERVICE)
             if not cm:
                 return
+            lrc_meta = self._lyrics_helper.get_lyrics_meta(self._last_active_clean_a, self._last_active_clean_t) if self._last_active_clean_t else {}
+            sync_trace_lines = list(self._sync_trace_log)
             last_lines = list(CLOG.ring_buffer)[-200:]
             report = (
                 f"=== ДАМП CLAWD LYRICS v{__version__} ===\n"
                 f"Время: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
                 f"Статус моста: mode={self._bridge_mode}, errors={self._bridge_consecutive_errors}, latency={self._bridge_last_ping_latency:.1f}ms\n"
-                f"Текущий трек: {self._current_track_id} (speed={self._playback_speed:.2f}x)\n"
+                f"Текущий трек: {self._current_track_id} (dur={self._active_duration_ms/1000.0:.1f}s, speed={self._playback_speed:.2f}x, src={self._last_sync_source})\n"
+                f"Якорь: raw={self._last_raw_pos_ms}ms, calc={self._get_current_track_pos_ms():.0f}ms, Δ={self._last_sync_delta_ms:+.0f}ms, idx={self._current_lyric_idx}/{len(self._lyrics_timeline)}\n"
+                f"LRC совпадение: src={lrc_meta.get('source', 'NONE')}, '{lrc_meta.get('matched_artist', '')} - {lrc_meta.get('matched_title', '')}', lrc_dur={lrc_meta.get('duration_sec', 0):.1f}s, score={lrc_meta.get('score', 0):.1f}\n"
                 f"Смещение _user_offset: {self._user_offset:.3f} с\n"
                 f"Масштаб: {self._bubble_scale():.2f}x, X={self._cfg.get('pos_x_pct', 0.5):.2f}, Y={self._cfg.get('pos_y_pct', 0.12):.2f}\n"
-                f"\n=== ПОСЛЕДНИЕ 200 СТРОК ЛОГА ===\n"
+                f"\n=== ТРАССИРОВКА СИНХРОНИЗАЦИИ (ПОСЛЕДНИЕ {len(sync_trace_lines)} СОБЫТИЙ) ===\n"
+                + ("\n".join(sync_trace_lines) if sync_trace_lines else "(пусто)")
+                + f"\n\n=== ПОСЛЕДНИЕ 200 СТРОК ЛОГА ===\n"
                 + "\n".join(last_lines)
             )
             cm.setPrimaryClip(ClipData.newPlainText("Clawd Lyrics Diagnostics", report))
@@ -1268,6 +1549,7 @@ class ClawdLyricsPlugin(BasePlugin):
             "animated_gradient_border": bool(self.get_setting("animated_gradient_border", True)),
             "media_controls": bool(self.get_setting("media_controls", True)),
             "show_on_pause": bool(self.get_setting("show_on_pause", False)),
+            "sync_debug_hud": bool(self.get_setting("sync_debug_hud", False)),
             "clipboard_sync": bool(self.get_setting("clipboard_sync", False)),
         }
         self._sync_offset_ms = 0.0
@@ -1285,6 +1567,8 @@ class ClawdLyricsPlugin(BasePlugin):
             run_on_ui_thread(self._position_lyrics_bubble)
         elif key == "media_controls":
             run_on_ui_thread(self._apply_controls_visibility)
+        elif key == "sync_debug_hud":
+            run_on_ui_thread(lambda: (setattr(self, "_last_hud_upd", 0.0), self._update_sync_debug_hud(time.monotonic()), self._relayout_bubble(), self._position_lyrics_bubble()))
 
     def _apply_controls_visibility(self):
         if self._media_controls_layout is not None:
@@ -1322,6 +1606,12 @@ class ClawdLyricsPlugin(BasePlugin):
                     btn.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 14.0 * s)
                     hpad = max(3, AndroidUtilities.dp(8.0 * s))
                     btn.setPadding(hpad, 0, hpad, 0)
+            if self._sync_debug_tv is not None:
+                self._sync_debug_tv.setTextSize(TypedValue.COMPLEX_UNIT_DIP, max(7.0, 9.0 * s))
+                self._sync_debug_tv.setPadding(
+                    max(3, AndroidUtilities.dp(6.0 * s)), max(1, AndroidUtilities.dp(2.0 * s)),
+                    max(3, AndroidUtilities.dp(6.0 * s)), max(1, AndroidUtilities.dp(2.0 * s)),
+                )
             prev_mode = self._bubble_mode
             self._bubble_mode = prev_mode
             self._karaoke_layer_drawable = None
@@ -1646,6 +1936,17 @@ class ClawdLyricsPlugin(BasePlugin):
         controls.addView(_make_btn("📋", lambda: self._open_tap_to_sync_dialog()))
         bubble_layout.addView(controls, LinearLayout.LayoutParams(-2, -2))
 
+        sync_debug_tv = TextView(context)
+        sync_debug_tv.setTextSize(TypedValue.COMPLEX_UNIT_DIP, max(7.0, 9.0 * s))
+        sync_debug_tv.setTextColor(as_java_color(0xFFB8E6FF))
+        sync_debug_tv.setGravity(Gravity.CENTER_HORIZONTAL)
+        sync_debug_tv.setPadding(
+            max(3, AndroidUtilities.dp(6.0 * s)), max(1, AndroidUtilities.dp(2.0 * s)),
+            max(3, AndroidUtilities.dp(6.0 * s)), max(1, AndroidUtilities.dp(2.0 * s)),
+        )
+        sync_debug_tv.setVisibility(View.GONE)
+        bubble_layout.addView(sync_debug_tv, LinearLayout.LayoutParams(-2, -2))
+
         self._decor.addView(bubble_layout, FrameLayout.LayoutParams(-2, -2))
         self._bubble = bubble_layout
         self._artwork_row = artwork_row
@@ -1654,6 +1955,7 @@ class ClawdLyricsPlugin(BasePlugin):
         self._artwork_title_tv = artwork_title_tv
         self._bubble_text = bubble_text
         self._bubble_subtext = bubble_subtext
+        self._sync_debug_tv = sync_debug_tv
         self._media_controls_layout = controls
         self._bubble_visible = False
 
@@ -1697,6 +1999,7 @@ class ClawdLyricsPlugin(BasePlugin):
         self._artwork_title_tv = None
         self._bubble_text = None
         self._bubble_subtext = None
+        self._sync_debug_tv = None
         self._media_controls_layout = None
         self._media_ctrl_btns = []
         self._bubble_touch_listener = None
@@ -1859,6 +2162,7 @@ class ClawdLyricsPlugin(BasePlugin):
                         self._do_karaoke_line_switch()
 
             if self._bubble_visible:
+                self._update_sync_debug_hud(now)
                 if not self._track_is_playing and not self._cfg.get("show_on_pause", False):
                     if self._media == "music" and self._bubble_mode == "karaoke":
                         self._bubble_until = min(self._bubble_until, now + 1.2)
@@ -1873,6 +2177,42 @@ class ClawdLyricsPlugin(BasePlugin):
         self._schedule(100)
 
 # === [SHARED_BLOCK:PLAYER_ENGINE] ===
+    def _record_sync_trace(self, tag: str, msg: str):
+        ts = time.strftime("%H:%M:%S")
+        entry = f"{ts} | {tag:<5} | {msg}"
+        self._sync_trace_log.append(entry)
+        CLOG.log_debug("SYNC_TRACE", f"[{tag}] {msg}")
+
+    def _update_sync_debug_hud(self, now: float):
+        tv = self._sync_debug_tv
+        if tv is None:
+            return
+        show_hud = bool(self._cfg.get("sync_debug_hud", False)) and (self._media == "music" or self._test_karaoke_active) and (self._bubble_mode == "karaoke")
+        if not show_hud:
+            if tv.getVisibility() != View.GONE:
+                tv.setVisibility(View.GONE)
+            return
+        if now - self._last_hud_upd < 0.18:
+            return
+        self._last_hud_upd = now
+        calc_ms = self._get_current_track_pos_ms(now)
+        raw_s = float(self._last_raw_pos_ms) / 1000.0
+        calc_s = calc_ms / 1000.0
+        meta = self._lyrics_helper.get_lyrics_meta(self._last_active_clean_a, self._last_active_clean_t) if self._last_active_clean_t else {}
+        lrc_src = meta.get("source", "NONE")
+        lrc_dur = float(meta.get("duration_sec") or 0.0)
+        trk_dur = float(self._active_duration_ms) / 1000.0
+        tot = len(self._lyrics_timeline)
+        hud_txt = (
+            f"SRC:{self._last_sync_source} | raw:{raw_s:.2f}s calc:{calc_s:.2f}s Δ:{self._last_sync_delta_ms:+.0f}ms\n"
+            f"off:{self._user_offset:+.2f}s | idx:{self._current_lyric_idx}/{tot} | LRC:{lrc_src}({lrc_dur:.0f}s/{trk_dur:.0f}s)"
+        )
+        if tv.getVisibility() != View.VISIBLE:
+            tv.setVisibility(View.VISIBLE)
+        if hud_txt != self._last_hud_text:
+            self._last_hud_text = hud_txt
+            tv.setText(hud_txt)
+
     def _clear_playback_anchors(self, reset_user_offset: bool = False):
         self._anchor_pos_ms = 0.0
         self._anchor_mono = 0.0
@@ -1883,6 +2223,14 @@ class ClawdLyricsPlugin(BasePlugin):
         self._playback_speed = 1.0
         self._last_sse_rx_mono = 0.0
         self._last_processed_bridge_rx_mono = 0.0
+        self._last_bridge_raw_pos_ms = -1
+        self._last_bridge_raw_rx_mono = 0.0
+        self._last_tg_raw_pos_ms = -1
+        self._bridge_back_snap_streak = 0
+        self._last_sync_source = "NONE"
+        self._last_sync_delta_ms = 0.0
+        self._last_raw_pos_ms = 0
+        self._active_duration_ms = 0
         self._current_lyric_idx = -1
         self._is_singing = False
         if reset_user_offset:
@@ -1895,7 +2243,10 @@ class ClawdLyricsPlugin(BasePlugin):
             now = time.monotonic()
         if not self._track_is_playing or self._anchor_mono <= 0.0:
             return self._anchor_pos_ms
-        return self._anchor_pos_ms + max(0.0, now - self._anchor_mono) * 1000.0 * self._anchor_speed
+        pos = self._anchor_pos_ms + max(0.0, now - self._anchor_mono) * 1000.0 * self._anchor_speed
+        if self._active_duration_ms > 1000:
+            pos = min(pos, float(self._active_duration_ms) + 1500.0)
+        return pos
 
     def _get_current_track_pos(self, now: float) -> float:
         return self._get_current_track_pos_ms(now) / 1000.0
@@ -1922,7 +2273,7 @@ class ClawdLyricsPlugin(BasePlugin):
         exp_t = parts[2] if len(parts) >= 3 else (parts[1] if len(parts) == 2 else "")
 
         def _snap_valid(s) -> bool:
-            if not s or not s.get("has_media") or not s.get("is_playing"):
+            if not s or not s.get("has_media") or not s.get("is_playing") or not bool(s.get("position_known", True)):
                 return False
             if exp_player == "Telegram":
                 return self._bridge_matches(s, exp_a, exp_t)
@@ -1946,6 +2297,11 @@ class ClawdLyricsPlugin(BasePlugin):
                 self._track_base_pos = pos_ms / 1000.0
                 self._track_base_time = rx_mono
                 self._last_processed_bridge_rx_mono = max(self._last_processed_bridge_rx_mono, rx_mono)
+                self._last_bridge_raw_pos_ms = int(pos_ms)
+                self._last_bridge_raw_rx_mono = rx_mono
+                self._last_raw_pos_ms = int(pos_ms)
+                self._bridge_back_snap_streak = 0
+                self._record_sync_trace("REANC", f"post-LRC anchor pos={pos_ms:.0f}ms spd={spd:.2f}x")
                 self._current_lyric_idx = -1
                 self._do_karaoke_line_switch()
                 return
@@ -1976,6 +2332,10 @@ class ClawdLyricsPlugin(BasePlugin):
                     self._track_base_pos = pos_fresh / 1000.0
                     self._track_base_time = rx_fresh
                     self._last_processed_bridge_rx_mono = max(self._last_processed_bridge_rx_mono, rx_fresh)
+                    self._last_bridge_raw_pos_ms = int(pos_fresh)
+                    self._last_bridge_raw_rx_mono = rx_fresh
+                    self._last_raw_pos_ms = int(pos_fresh)
+                    self._bridge_back_snap_streak = 0
                     self._current_lyric_idx = -1
                     self._do_karaoke_line_switch()
 
@@ -2048,6 +2408,7 @@ class ClawdLyricsPlugin(BasePlugin):
         accent_color: Optional[int] = None
         palette_3: Tuple[int, int, int] = DEFAULT_KARAOKE_PALETTE
         has_artwork = False
+        sync_source = "NONE"
 
         # Проверка окончания тестового режима караоке и приоритета реального воспроизведения
         tg_playing_now = False
@@ -2070,6 +2431,7 @@ class ClawdLyricsPlugin(BasePlugin):
                         prog = float(getattr(playing, "audioProgress", 0.0))
                         track_position_ms = int(dur_sec * prog * 1000)
                         position_known = True
+                        sync_source = "TG"
                     else:
                         tg_paused_music = playing
             except Exception as e:
@@ -2092,6 +2454,7 @@ class ClawdLyricsPlugin(BasePlugin):
                 test_done = True
             if not test_done:
                 self._track_is_playing = True
+                self._last_sync_source = "DEMO"
                 return
             self._test_karaoke_active = False
 
@@ -2112,13 +2475,15 @@ class ClawdLyricsPlugin(BasePlugin):
                     except Exception:
                         playback_speed = 1.0
                     b_rx = float(bridge_snapshot.get("_received_mono") or 0.0)
-                    if bridge_snapshot.get("is_playing") and b_rx > 0.0:
+                    b_pos_known = bool(bridge_snapshot.get("position_known", True))
+                    if bridge_snapshot.get("is_playing") and b_rx > 0.0 and b_pos_known:
                         used_bridge = True
                         track_position_ms = int(bridge_snapshot.get("position_ms") or 0)
                         if int(bridge_snapshot.get("duration_ms") or 0) > 0:
                             duration_ms = int(bridge_snapshot.get("duration_ms") or 0)
-                        position_known = bool(bridge_snapshot.get("position_known", True))
+                        position_known = True
                         bridge_rx_mono = b_rx
+                        sync_source = "TG+SSE" if bridge_snapshot.get("_is_sse_event") else "TG+Poll"
             else:
                 if bridge_snapshot and bridge_snapshot.get("has_media") and bridge_snapshot.get("is_playing"):
                     used_bridge = True
@@ -2139,6 +2504,7 @@ class ClawdLyricsPlugin(BasePlugin):
                     accent_color = parse_hex_color(bridge_snapshot.get("accent_color"))
                     palette_3 = derive_palette_3(bridge_snapshot.get("accent_color"), bridge_snapshot.get("accent_colors"))
                     has_artwork = bool(bridge_snapshot.get("has_artwork", False))
+                    sync_source = "Bridge-SSE" if bridge_snapshot.get("_is_sse_event") else ("SyncFile" if bridge_snapshot.get("is_fallback") else "Bridge-Poll")
                 elif tg_paused_music is not None:
                     kind = "music"
                     is_playing = False
@@ -2150,13 +2516,14 @@ class ClawdLyricsPlugin(BasePlugin):
                     prog = float(getattr(tg_paused_music, "audioProgress", 0.0))
                     track_position_ms = int(dur_sec * prog * 1000)
                     position_known = True
+                    sync_source = "TG(pause)"
                     if self._bridge_matches(bridge_snapshot, track_artist, track_title):
                         used_bridge_art = True
                         accent_color = parse_hex_color(bridge_snapshot.get("accent_color"))
                         palette_3 = derive_palette_3(bridge_snapshot.get("accent_color"), bridge_snapshot.get("accent_colors"))
                         has_artwork = bool(bridge_snapshot.get("has_artwork", False))
                         b_rx = float(bridge_snapshot.get("_received_mono") or 0.0)
-                        if b_rx > 0.0:
+                        if b_rx > 0.0 and bool(bridge_snapshot.get("position_known", True)):
                             used_bridge = True
                             track_position_ms = int(bridge_snapshot.get("position_ms") or track_position_ms)
                             bridge_rx_mono = b_rx
@@ -2179,6 +2546,12 @@ class ClawdLyricsPlugin(BasePlugin):
                     accent_color = parse_hex_color(bridge_snapshot.get("accent_color"))
                     palette_3 = derive_palette_3(bridge_snapshot.get("accent_color"), bridge_snapshot.get("accent_colors"))
                     has_artwork = bool(bridge_snapshot.get("has_artwork", False))
+                    sync_source = "Bridge(pause)"
+
+        self._last_sync_source = sync_source
+        self._last_raw_pos_ms = track_position_ms
+        if duration_ms > 0:
+            self._active_duration_ms = duration_ms
 
         if kind == "music":
             self._accent_color = accent_color
@@ -2202,6 +2575,9 @@ class ClawdLyricsPlugin(BasePlugin):
                 self._current_track_id = triplet_id
                 self._lyrics_timeline = []
                 self._clear_playback_anchors(reset_user_offset=False)
+                self._last_sync_source = sync_source
+                self._last_raw_pos_ms = track_position_ms
+                self._active_duration_ms = duration_ms
                 self._lyrics_retry_count = 0
                 self._last_lyrics_retry = 0.0
                 self._clear_artwork()
@@ -2210,9 +2586,10 @@ class ClawdLyricsPlugin(BasePlugin):
                 self._user_offset = self._session_offsets.get(track_offset_key, 0.0)
                 self._sync_offset_ms = self._user_offset * 1000.0
 
+                self._record_sync_trace("TRACK", f"'{clean_a} - {clean_t}' src={sync_source} dur={duration_ms/1000:.1f}s pos={track_position_ms}ms")
                 CLOG.log_info(
                     "TRACK",
-                    f"Смена трека: '{clean_a}' — '{clean_t}' (player={player_name}, speed={playback_speed:.2f}x, offset={self._sync_offset_ms:.0f}мс)",
+                    f"Смена трека: '{clean_a}' — '{clean_t}' (player={player_name}, dur={duration_ms/1000.0:.1f}с, speed={playback_speed:.2f}x, offset={self._sync_offset_ms:.0f}мс)",
                     player=player_name,
                     artist=clean_a,
                     title=clean_t,
@@ -2232,13 +2609,18 @@ class ClawdLyricsPlugin(BasePlugin):
                             if self._unloaded or self._current_track_id != expected_track_id:
                                 return
                             self._lyrics_timeline = tl
+                            meta = self._lyrics_helper.get_lyrics_meta(clean_a, clean_t)
+                            self._record_sync_trace(
+                                "LRC",
+                                f"{meta.get('source', 'NONE')} lines={len(tl)} lrc_dur={meta.get('duration_sec', 0):.0f}s trk_dur={self._active_duration_ms/1000:.0f}s score={meta.get('score', 0):.1f}",
+                            )
                             if not tl:
                                 self._say("no_lyrics")
                                 return
                             self._apply_fresh_bridge_anchor_and_jump(expected_track_id)
                         run_on_ui_thread(_apply)
 
-                    self._lyrics_helper.get_lyrics_async(clean_a, clean_t, _on_lyrics_loaded)
+                    self._lyrics_helper.get_lyrics_async(clean_a, clean_t, _on_lyrics_loaded, duration_ms=duration_ms)
 
             elif kind == "music" and is_playing and not self._lyrics_timeline and (clean_a or clean_t):
                 if self._lyrics_retry_count < 3 and (now - self._last_lyrics_retry >= 6.0):
@@ -2264,7 +2646,7 @@ class ClawdLyricsPlugin(BasePlugin):
                                 self._say("no_lyrics")
                         run_on_ui_thread(_apply_retry)
 
-                    self._lyrics_helper.get_lyrics_async(clean_a, clean_t, _on_retry_loaded)
+                    self._lyrics_helper.get_lyrics_async(clean_a, clean_t, _on_retry_loaded, duration_ms=duration_ms)
 
             # Обложка: запрашивается ОДИН раз при смене трека ИЛИ при изменении has_artwork: False -> True (включая треки Telegram через Bridge)
             if used_bridge_art:
@@ -2277,7 +2659,7 @@ class ClawdLyricsPlugin(BasePlugin):
                     label = f"{clean_a} — {clean_t}" if clean_a else clean_t
                     self._fetch_artwork_async(triplet_id, label)
 
-        # Монотонный якорь + 3-уровневая анти-дрейфовая коррекция на чекпоинтах Bridge
+        # Монотонный якорь + 3-уровневая анти-дрейфовая коррекция + защита от замерзших/квантованных пакетов
         self._position_known = position_known
         if kind == "music":
             was_paused = not self._track_is_playing
@@ -2298,6 +2680,7 @@ class ClawdLyricsPlugin(BasePlugin):
                 self._track_base_time = 0.0
                 self._track_is_playing = False
                 self._is_singing = False
+                self._bridge_back_snap_streak = 0
                 if self._handler and self._karaoke_switch_r:
                     self._handler.removeCallbacks(self._karaoke_switch_r)
             else:
@@ -2317,44 +2700,104 @@ class ClawdLyricsPlugin(BasePlugin):
                             self._anchor_speed = playback_speed
                             self._track_base_pos = self._anchor_pos_ms / 1000.0
                             self._track_base_time = pkt_mono
+                            self._last_bridge_raw_pos_ms = track_position_ms
+                            self._last_bridge_raw_rx_mono = pkt_mono
+                            self._bridge_back_snap_streak = 0
+                            self._last_sync_delta_ms = 0.0
                             self._current_lyric_idx = -1
                             self._do_karaoke_line_switch()
                         else:
-                            # Анти-дрейф на 2-секундных чекпоинтах строго в момент получения пакета
-                            local_at_rx_ms = self._anchor_pos_ms + max(0.0, pkt_mono - self._anchor_mono) * 1000.0 * self._anchor_speed
-                            delta = float(track_position_ms) - local_at_rx_ms
-                            if abs(delta) >= 180.0:
-                                CLOG.log_debug(
-                                    "ANTIDRIFT",
-                                    f"Мгновенный снап якоря: delta={delta:+.0f}мс",
-                                    delta_ms=f"{delta:.0f}",
+                            # Защита №1: если Bridge прислал точь-в-точь тот же position_ms < 3.5с подряд, не откатываем якорь назад!
+                            is_frozen_pkt = (
+                                self._last_bridge_raw_pos_ms >= 0
+                                and track_position_ms == self._last_bridge_raw_pos_ms
+                                and 0.0 < (pkt_mono - self._last_bridge_raw_rx_mono) < 3.5
+                            )
+                            if is_frozen_pkt:
+                                self._last_bridge_raw_rx_mono = pkt_mono
+                                self._bridge_back_snap_streak = 0
+                            else:
+                                local_at_rx_ms = self._anchor_pos_ms + max(0.0, pkt_mono - self._anchor_mono) * 1000.0 * self._anchor_speed
+                                delta = float(track_position_ms) - local_at_rx_ms
+                                self._last_sync_delta_ms = delta
+
+                                # Защита №2: квантованный шаг MediaSession (вперёд по секундам), дающий ложный мелкий откат (-180..-1200мс)
+                                is_quant_back = (
+                                    -1200.0 < delta <= -180.0
+                                    and self._last_bridge_raw_pos_ms >= 0
+                                    and track_position_ms >= self._last_bridge_raw_pos_ms - 100
                                 )
-                                self._anchor_pos_ms = float(track_position_ms)
-                                self._anchor_mono = pkt_mono
-                                self._anchor_speed = playback_speed
-                                self._track_base_pos = self._anchor_pos_ms / 1000.0
-                                self._track_base_time = pkt_mono
-                                self._do_karaoke_line_switch()
-                            elif abs(delta) > 50.0:
-                                CLOG.log_debug(
-                                    "ANTIDRIFT",
-                                    f"Мягкая коррекция якоря: delta={delta:+.0f}мс (сдвиг {delta*0.5:+.0f}мс)",
-                                    delta_ms=f"{delta:.0f}",
-                                )
-                                self._anchor_pos_ms += delta * 0.5
-                                self._track_base_pos = self._anchor_pos_ms / 1000.0
-                                self._reschedule_karaoke_switch()
+                                if is_quant_back:
+                                    self._bridge_back_snap_streak += 1
+                                    if self._bridge_back_snap_streak < 2:
+                                        self._record_sync_trace("QHOLD", f"raw={track_position_ms} local={local_at_rx_ms:.0f} Δ={delta:+.0f}ms (фильтр пилы)")
+                                        self._anchor_pos_ms += delta * 0.20
+                                        self._track_base_pos = self._anchor_pos_ms / 1000.0
+                                        self._reschedule_karaoke_switch()
+                                    else:
+                                        self._bridge_back_snap_streak = 0
+                                        self._anchor_pos_ms = float(track_position_ms)
+                                        self._anchor_mono = pkt_mono
+                                        self._anchor_speed = playback_speed
+                                        self._track_base_pos = self._anchor_pos_ms / 1000.0
+                                        self._track_base_time = pkt_mono
+                                        self._record_sync_trace("BSNAP", f"confirmed back Δ={delta:+.0f}ms -> {track_position_ms}ms")
+                                        self._do_karaoke_line_switch()
+                                elif abs(delta) >= 180.0:
+                                    self._bridge_back_snap_streak = 0
+                                    CLOG.log_debug(
+                                        "ANTIDRIFT",
+                                        f"Мгновенный снап якоря: delta={delta:+.0f}мс",
+                                        delta_ms=f"{delta:.0f}",
+                                    )
+                                    self._record_sync_trace("SNAP", f"raw={track_position_ms} local={local_at_rx_ms:.0f} Δ={delta:+.0f}ms")
+                                    self._anchor_pos_ms = float(track_position_ms)
+                                    self._anchor_mono = pkt_mono
+                                    self._anchor_speed = playback_speed
+                                    self._track_base_pos = self._anchor_pos_ms / 1000.0
+                                    self._track_base_time = pkt_mono
+                                    if abs(delta) >= 1200.0:
+                                        self._current_lyric_idx = -1
+                                    self._do_karaoke_line_switch()
+                                elif abs(delta) > 50.0:
+                                    self._bridge_back_snap_streak = 0
+                                    CLOG.log_debug(
+                                        "ANTIDRIFT",
+                                        f"Мягкая коррекция якоря: delta={delta:+.0f}мс (сдвиг {delta*0.5:+.0f}мс)",
+                                        delta_ms=f"{delta:.0f}",
+                                    )
+                                    self._anchor_pos_ms += delta * 0.5
+                                    self._track_base_pos = self._anchor_pos_ms / 1000.0
+                                    self._reschedule_karaoke_switch()
+                                else:
+                                    self._bridge_back_snap_streak = 0
+                                self._last_bridge_raw_pos_ms = track_position_ms
+                                self._last_bridge_raw_rx_mono = pkt_mono
                 else:
-                    # Telegram MediaController без Bridge: порог перемотки 850 мс, чтобы округлённый getDuration() не срывал монотонный якорь
+                    # Telegram MediaController без Bridge: порог перемотки 850 мс + защита от замерзшего audioProgress
                     local_ms = self._get_current_track_pos_ms(now)
                     delta = float(track_position_ms) - local_ms
-                    if track_changed or resumed or self._anchor_mono <= 0.0 or speed_changed or abs(delta) >= 850.0:
+                    self._last_sync_delta_ms = delta
+                    is_frozen_tg = (
+                        not track_changed
+                        and not resumed
+                        and self._anchor_mono > 0.0
+                        and not speed_changed
+                        and self._last_tg_raw_pos_ms >= 0
+                        and track_position_ms == self._last_tg_raw_pos_ms
+                        and delta < 0.0
+                        and abs(delta) < 2200.0
+                    )
+                    self._last_tg_raw_pos_ms = track_position_ms
+                    if track_changed or resumed or self._anchor_mono <= 0.0 or speed_changed or (not is_frozen_tg and abs(delta) >= 850.0):
+                        if abs(delta) >= 850.0 and not track_changed and not resumed:
+                            self._record_sync_trace("TGSNP", f"raw={track_position_ms} local={local_ms:.0f} Δ={delta:+.0f}ms")
                         self._anchor_pos_ms = float(track_position_ms)
                         self._anchor_mono = now
                         self._anchor_speed = playback_speed
                         self._track_base_pos = self._anchor_pos_ms / 1000.0
                         self._track_base_time = now
-                        if resumed or self._bubble_mode != "karaoke" or abs(delta) >= 850.0:
+                        if resumed or self._bubble_mode != "karaoke" or abs(delta) >= 1200.0:
                             self._current_lyric_idx = -1
                         self._do_karaoke_line_switch()
         else:
@@ -2491,6 +2934,7 @@ class ClawdLyricsPlugin(BasePlugin):
                 self._is_singing = True
                 if cur_idx != self._current_lyric_idx:
                     self._current_lyric_idx = cur_idx
+                    self._record_sync_trace("LINE", f"#{cur_idx}/{len(self._lyrics_timeline)} lrc={t_curr:.2f}s pos={t_karaoke:.2f}s | {cur_line[:24]}")
                     self._show_karaoke_line(cur_line, next_line, now)
             else:
                 self._is_singing = False
@@ -2514,6 +2958,10 @@ class ClawdLyricsPlugin(BasePlugin):
     def _animate_text_change(self, view: TextView, new_text: str, target_alpha: float = 1.0, animate: Optional[bool] = None):
         if view is None:
             return
+        vid = id(view)
+        seq = self._text_anim_seq.get(vid, 0) + 1
+        self._text_anim_seq[vid] = seq
+
         should_animate = self._bubble_visible if animate is None else bool(animate)
         shift_dp = float(AndroidUtilities.dp(5))
         old_text = ""
@@ -2525,10 +2973,18 @@ class ClawdLyricsPlugin(BasePlugin):
             old_text = ""
 
         if old_text == new_text and float(view.getAlpha()) > 0.05:
+            try:
+                view.animate().withEndAction(None).cancel()
+            except Exception:
+                pass
             view.animate().alpha(target_alpha).translationY(0.0).setDuration(85).start()
             return
 
         if not old_text or not should_animate:
+            try:
+                view.animate().withEndAction(None).cancel()
+            except Exception:
+                pass
             view.setText(new_text)
             view.setTranslationY(0.0)
             view.setAlpha(target_alpha)
@@ -2537,12 +2993,12 @@ class ClawdLyricsPlugin(BasePlugin):
             return
 
         try:
-            view.animate().cancel()
+            view.animate().withEndAction(None).cancel()
             gen = self._bubble_gen
 
             def _on_faded_out():
                 try:
-                    if gen != self._bubble_gen or self._bubble_mode != "karaoke" or not self._bubble_visible:
+                    if seq != self._text_anim_seq.get(vid) or gen != self._bubble_gen or self._bubble_mode != "karaoke" or not self._bubble_visible:
                         return
                     view.setText(new_text)
                     view.setTranslationY(shift_dp)
@@ -2690,6 +3146,7 @@ class ClawdLyricsPlugin(BasePlugin):
             self._bubble_text,
             self._bubble_subtext,
             self._media_controls_layout,
+            self._sync_debug_tv,
         ):
             if v is not None:
                 if isinstance(v, TextView):
@@ -2742,6 +3199,10 @@ class ClawdLyricsPlugin(BasePlugin):
             self._bubble_subtext.setMaxWidth(max_w)
             self._bubble_subtext.setGravity(Gravity.CENTER_HORIZONTAL)
             self._bubble_subtext.setLayoutParams(LinearLayout.LayoutParams(-2, -2))
+        if self._sync_debug_tv is not None:
+            self._sync_debug_tv.setTextSize(TypedValue.COMPLEX_UNIT_DIP, max(7.0, 9.0 * s))
+            self._sync_debug_tv.setMaxWidth(max_w)
+            self._sync_debug_tv.setLayoutParams(LinearLayout.LayoutParams(-2, -2))
         self._relayout_bubble()
 
     def _apply_speech_geometry(self, s: float):
@@ -2776,6 +3237,8 @@ class ClawdLyricsPlugin(BasePlugin):
             self._bubble_subtext.setVisibility(View.GONE)
         if self._media_controls_layout is not None:
             self._media_controls_layout.setVisibility(View.GONE)
+        if self._sync_debug_tv is not None:
+            self._sync_debug_tv.setVisibility(View.GONE)
         self._relayout_bubble()
 
     def _show_karaoke_line(self, current_text: str, next_text: str, now: float):
@@ -2816,6 +3279,7 @@ class ClawdLyricsPlugin(BasePlugin):
             self._bubble.setAlpha(1.0)
             self._bubble_visible = True
             self._bubble_until = now + 9.0
+            self._update_sync_debug_hud(now)
             self._bubble.forceLayout()
             self._bubble.requestLayout()
             if hasattr(self, "_on_bubble_resized"):
@@ -2823,27 +3287,156 @@ class ClawdLyricsPlugin(BasePlugin):
         except Exception as e:
             CLOG.log_error("KARAOKE_UI", "Show line error", e)
 
-    # 2.3 Механика Tap-to-Sync (Выбор строки)
+    def _force_refetch_current_lyrics(self):
+        clean_a = getattr(self, "_last_active_clean_a", "")
+        clean_t = getattr(self, "_last_active_clean_t", "")
+        if not clean_t:
+            return
+        expected_id = self._current_track_id
+        self._say("Ищу свежий текст...", force=True)
+
+        def _on_fresh(tl):
+            def _apply():
+                if self._unloaded or self._current_track_id != expected_id:
+                    return
+                self._lyrics_timeline = tl
+                meta = self._lyrics_helper.get_lyrics_meta(clean_a, clean_t)
+                cands = meta.get("candidates") or []
+                self._record_sync_trace("REFETCH", f"src={meta.get('source')} lines={len(tl)} cands={len(cands)}")
+                if len(cands) > 1:
+                    self._open_lrc_candidates_dialog(clean_a, clean_t, expected_id, cands)
+                elif tl:
+                    self._apply_fresh_bridge_anchor_and_jump(expected_id)
+                else:
+                    self._say("no_lyrics", force=True)
+            run_on_ui_thread(_apply)
+
+        self._lyrics_helper.get_lyrics_async(
+            clean_a, clean_t, _on_fresh, duration_ms=self._active_duration_ms, force_refresh=True
+        )
+
+    def _open_lrc_candidates_dialog(self, clean_a: str, clean_t: str, expected_id: str, cands: List[Dict[str, Any]]):
+        try:
+            ctx = self._get_safe_activity()
+            if not ctx or not cands:
+                return
+            items = []
+            for c in cands:
+                cdur = float(c.get("duration") or 0.0)
+                mm, ss = int(cdur // 60), int(cdur % 60)
+                dur_str = f"{mm:02d}:{ss:02d}" if cdur > 0 else "?:??"
+                items.append(f"[{c.get('source', '?')} • {dur_str}] {c.get('artist', '')} — {c.get('title', '')}")
+
+            b = AlertDialog.Builder(ctx)
+            b.setTitle("Выберите подходящий текст (LRC)")
+
+            def _on_pick(_d, which):
+                if 0 <= which < len(cands) and self._current_track_id == expected_id:
+                    tl = self._lyrics_helper.apply_manual_candidate(clean_a, clean_t, cands[which])
+                    if tl:
+                        self._lyrics_timeline = tl
+                        self._apply_fresh_bridge_anchor_and_jump(expected_id)
+
+            b.setItems(items, DialogClickListener(_on_pick))
+            b.setPositiveButton("Закрыть", None)
+            b.show()
+        except Exception as e:
+            CLOG.log_error("LRC_PICK", "Candidates dialog error", e)
+
+    # 2.3 Механика Tap-to-Sync (Выбор строки + сдвиг + смена LRC + HUD)
     def _open_tap_to_sync_dialog(self):
         try:
             ctx = self._get_safe_activity()
             if not ctx:
                 return
-            if not self._lyrics_timeline:
-                self._say("Слова ещё не загружены!", force=True)
-                return
 
-            items = []
-            for t_sec, text in self._lyrics_timeline:
-                mm = int(t_sec // 60)
-                ss = int(t_sec % 60)
-                items.append(f"[{mm:02d}:{ss:02d}] {text}")
+            clean_a = getattr(self, "_last_active_clean_a", "")
+            clean_t = getattr(self, "_last_active_clean_t", "")
+            if not clean_t and self._current_track_id:
+                parts = self._current_track_id.split("::")
+                if len(parts) >= 3:
+                    clean_a, clean_t = parts[1], parts[2]
+                elif len(parts) == 2:
+                    clean_t = parts[1]
+            canon_key = f"{clean_a} - {clean_t}".strip(" -")
 
-            b = AlertDialog.Builder(ctx)
-            b.setTitle("Tap-to-Sync: Выберите строку трека")
+            root = LinearLayout(ctx)
+            root.setOrientation(LinearLayout.VERTICAL)
+            p14 = AndroidUtilities.dp(14)
+            p8 = AndroidUtilities.dp(8)
+            root.setPadding(p14, p8, p14, p8)
 
-            def _on_line_selected(_d, which):
-                if 0 <= which < len(self._lyrics_timeline):
+            meta = self._lyrics_helper.get_lyrics_meta(clean_a, clean_t) if clean_t else {}
+            status_tv = TextView(ctx)
+            status_tv.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 12.0)
+            status_tv.setPadding(0, 0, 0, p8)
+
+            def _refresh_status():
+                status_tv.setText(
+                    f"SRC: {self._last_sync_source} | Сдвиг: {self._user_offset:+.2f}с | Δ: {self._last_sync_delta_ms:+.0f}мс\n"
+                    f"LRC: {meta.get('source', 'NONE')} ({meta.get('duration_sec', 0):.0f}с / трек {self._active_duration_ms/1000:.0f}с)"
+                )
+
+            _refresh_status()
+            root.addView(status_tv, LinearLayout.LayoutParams(-1, -2))
+
+            def _nudge(delta_sec: Optional[float]):
+                now = time.monotonic()
+                if delta_sec is None:
+                    self._user_offset = 0.0
+                else:
+                    self._user_offset = round(self._user_offset + delta_sec, 2)
+                self._sync_offset_ms = self._user_offset * 1000.0
+                if canon_key:
+                    self._session_offsets[canon_key] = self._user_offset
+                self._record_sync_trace("OFFSET", f"manual offset={self._user_offset:+.2f}s")
+                _refresh_status()
+                self._last_hud_upd = 0.0
+                self._current_lyric_idx = -1
+                self._do_karaoke_line_switch()
+
+            nudge_row = LinearLayout(ctx)
+            nudge_row.setOrientation(LinearLayout.HORIZONTAL)
+            nudge_row.setGravity(Gravity.CENTER)
+            for lbl, dv in (("-0.5с", -0.5), ("-0.2с", -0.2), ("0с", None), ("+0.2с", 0.2), ("+0.5с", 0.5)):
+                btn = TextView(ctx)
+                btn.setText(lbl)
+                btn.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 12.5)
+                btn.setPadding(AndroidUtilities.dp(8), AndroidUtilities.dp(6), AndroidUtilities.dp(8), AndroidUtilities.dp(6))
+                btn.setOnClickListener(ViewClickListener(lambda _v, d=dv: _nudge(d)))
+                nudge_row.addView(btn, LinearLayout.LayoutParams(-2, -2))
+            root.addView(nudge_row, LinearLayout.LayoutParams(-1, -2))
+
+            dlg_ref = [None]
+            tools_row = LinearLayout(ctx)
+            tools_row.setOrientation(LinearLayout.HORIZONTAL)
+            tools_row.setGravity(Gravity.CENTER)
+            tools_row.setPadding(0, 0, 0, p8)
+
+            def _toggle_hud():
+                new_val = not bool(self._cfg.get("sync_debug_hud", False))
+                self.set_setting("sync_debug_hud", new_val)
+                self._on_cfg_change("sync_debug_hud", new_val)
+
+            for lbl, fn in (
+                ("🔄 Другой текст", lambda: (dlg_ref[0].dismiss() if dlg_ref[0] else None, self._force_refetch_current_lyrics())),
+                ("🐞 HUD", _toggle_hud),
+                ("📋 Отчёт", lambda: self._copy_system_report()),
+            ):
+                btn = TextView(ctx)
+                btn.setText(lbl)
+                btn.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 12.0)
+                btn.setPadding(AndroidUtilities.dp(8), AndroidUtilities.dp(5), AndroidUtilities.dp(8), AndroidUtilities.dp(5))
+                btn.setOnClickListener(ViewClickListener(lambda _v, f=fn: f()))
+                tools_row.addView(btn, LinearLayout.LayoutParams(-2, -2))
+            root.addView(tools_row, LinearLayout.LayoutParams(-1, -2))
+
+            if self._lyrics_timeline:
+                scroll = ScrollView(ctx)
+                list_col = LinearLayout(ctx)
+                list_col.setOrientation(LinearLayout.VERTICAL)
+
+                def _select_line(which: int):
                     t_line, selected_text = self._lyrics_timeline[which]
                     now = time.monotonic()
                     t_calc_raw = self._get_current_track_pos(now)
@@ -2851,31 +3444,47 @@ class ClawdLyricsPlugin(BasePlugin):
                     new_offset = t_line - t_calc_raw
                     self._user_offset = new_offset
                     self._sync_offset_ms = new_offset * 1000.0
-
-                    clean_a = getattr(self, "_last_active_clean_a", "")
-                    clean_t = getattr(self, "_last_active_clean_t", "")
-                    if not clean_t and self._current_track_id:
-                        parts = self._current_track_id.split("::")
-                        if len(parts) >= 3:
-                            clean_a, clean_t = parts[1], parts[2]
-                        elif len(parts) == 2:
-                            clean_t = parts[1]
-                    canon_key = f"{clean_a} - {clean_t}".strip(" -")
                     if canon_key:
                         self._session_offsets[canon_key] = new_offset
-
+                    self._record_sync_trace("TAPSYNC", f"line #{which} t={t_line:.2f}s offset={new_offset:+.3f}s")
                     CLOG.log_info(
                         "SYNC",
                         f"Калибровка Tap-to-Sync: строка #{which} '{selected_text}', new_offset={new_offset:.3f}с",
                         line_index=which,
                         offset=f"{new_offset:.3f}",
                     )
-                    self._show_karaoke_line(selected_text, "", now)
+                    self._current_lyric_idx = which
+                    next_txt = self._lyrics_timeline[which + 1][1] if which + 1 < len(self._lyrics_timeline) else ""
+                    self._show_karaoke_line(selected_text, next_txt, now)
                     self._reschedule_karaoke_switch()
+                    if dlg_ref[0] is not None:
+                        dlg_ref[0].dismiss()
 
-            b.setItems(items, DialogClickListener(_on_line_selected))
+                for idx_l, (t_sec, text) in enumerate(self._lyrics_timeline):
+                    mm = int(t_sec // 60)
+                    ss = int(t_sec % 60)
+                    prefix = "▶ " if idx_l == self._current_lyric_idx else ""
+                    row_tv = TextView(ctx)
+                    row_tv.setText(f"{prefix}[{mm:02d}:{ss:02d}] {text}")
+                    row_tv.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 13.5)
+                    row_tv.setPadding(AndroidUtilities.dp(4), AndroidUtilities.dp(7), AndroidUtilities.dp(4), AndroidUtilities.dp(7))
+                    row_tv.setOnClickListener(ViewClickListener(lambda _v, i=idx_l: _select_line(i)))
+                    list_col.addView(row_tv, LinearLayout.LayoutParams(-1, -2))
+
+                scroll.addView(list_col)
+                lp_scroll = LinearLayout.LayoutParams(-1, AndroidUtilities.dp(260))
+                root.addView(scroll, lp_scroll)
+            else:
+                empty_tv = TextView(ctx)
+                empty_tv.setText("Слова не найдены. Нажмите «🔄 Другой текст».")
+                empty_tv.setPadding(0, p8, 0, p8)
+                root.addView(empty_tv, LinearLayout.LayoutParams(-1, -2))
+
+            b = AlertDialog.Builder(ctx)
+            b.setTitle("Tap-to-Sync и Отладка [📋]")
+            b.setView(root)
             b.setPositiveButton("Закрыть", None)
-            b.show()
+            dlg_ref[0] = b.show()
         except Exception as e:
             CLOG.log_error("SYNC_DIALOG", "Dialog error", e)
 
@@ -2888,6 +3497,8 @@ class ClawdLyricsPlugin(BasePlugin):
         self._current_track_id = track_id
         self._lyrics_timeline = []
         self._clear_playback_anchors(reset_user_offset=False)
+        self._last_active_clean_a = a
+        self._last_active_clean_t = t
         self._media = "music"
         self._track_is_playing = True
         self._anchor_pos_ms = 0.0
@@ -2934,6 +3545,7 @@ class ClawdLyricsPlugin(BasePlugin):
             if self._artwork_row is not None:
                 self._artwork_row.setVisibility(View.VISIBLE if self._artwork_bmp is not None else View.GONE)
             if self._bubble_text is not None:
+                self._bubble_text.animate().withEndAction(None).cancel()
                 self._bubble_text.setTextColor(as_java_color(0xFFFFFFFF))
                 self._bubble_text.setText(text)
                 self._bubble_text.setAlpha(1.0)
@@ -2941,6 +3553,7 @@ class ClawdLyricsPlugin(BasePlugin):
                 self._bubble_text.forceLayout()
                 self._bubble_text.requestLayout()
             if self._bubble_subtext is not None:
+                self._bubble_subtext.animate().withEndAction(None).cancel()
                 self._bubble_subtext.setText("")
                 self._bubble_subtext.setVisibility(View.GONE)
             if self._media_controls_layout is not None:

@@ -401,4 +401,55 @@ test('Clawd v3.5.1: blue headphones reset on stop/disable, dynamic scale relayou
   }
 });
 
+test('Clawd v3.5.2: sync anti-bounce, duration-aware LRC matching, animation race fix, and live sync debug HUD/trace', () => {
+  const petCode = fs.readFileSync(path.resolve(process.cwd(), 'public/clawd_v3_4.py'), 'utf-8');
+  const lyricsCode = fs.readFileSync(path.resolve(process.cwd(), 'public/clawd_lyrics_player.py'), 'utf-8');
+
+  for (const [label, code] of [
+    ['clawd_v3_4.py', petCode],
+    ['clawd_lyrics_player.py', lyricsCode],
+  ] as const) {
+    // 1. LRC accuracy: duration-aware candidate scoring, remix penalty, inline word-tag strip, duplicate-timestamp dedup, archive delete
+    assert.ok(
+      code.includes('def _score_candidate(') &&
+      code.includes('def fetch_lrclib_candidates(') &&
+      code.includes('def fetch_netease_candidates(') &&
+      code.includes('inline_word_tag = re.compile(') &&
+      code.includes('abs(t_sec - timeline[-1][0]) < 0.04') &&
+      code.includes('def delete_lyrics_archive('),
+      `${label}: missing duration-aware LRC scoring, enhanced tag stripping, timestamp dedup, or archive deletion`
+    );
+
+    // 2. Anti-bounce / anti-sawtooth sync guards (Bridge frozen & 1s quantized packets + Telegram frozen progress + position_known)
+    assert.ok(
+      code.includes('is_frozen_pkt') &&
+      code.includes('is_quant_back') &&
+      code.includes('_bridge_back_snap_streak') &&
+      code.includes('is_frozen_tg') &&
+      code.includes("bool(bridge_snapshot.get(\"position_known\", True))"),
+      `${label}: missing Bridge/TG frozen/quantized backward-snap filters or position_known guard`
+    );
+
+    // 3. Animation race protection & safe cancellation
+    assert.ok(
+      code.includes('self._text_anim_seq') &&
+      code.includes('.withEndAction(None).cancel()'),
+      `${label}: missing per-view _text_anim_seq token or withEndAction(None).cancel()`
+    );
+
+    // 4. Live sync debug HUD, 40-event trace buffer, LRC metadata in report, and upgraded Tap-to-Sync tools
+    assert.ok(
+      code.includes('key="sync_debug_hud"') &&
+      code.includes('self._sync_debug_tv') &&
+      code.includes('def _update_sync_debug_hud(') &&
+      code.includes('self._sync_trace_log') &&
+      code.includes('def _force_refetch_current_lyrics(') &&
+      code.includes('def _open_lrc_candidates_dialog(') &&
+      code.includes('LRC совпадение:'),
+      `${label}: missing sync_debug_hud, _sync_trace_log, LRC candidate picker, or diagnostic report dump`
+    );
+  }
+});
+
+
 
